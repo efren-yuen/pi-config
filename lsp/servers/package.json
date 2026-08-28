@@ -1,0 +1,13 @@
+{
+  "name": "pi-lsp-servers",
+  "private": true,
+  "description": "pi 自己管理的语言服务器，版本锁死，升级用 lsp install --upgrade",
+  "dependencies": {
+    "@vue/language-server": "3.3.11",
+    "@vue/typescript-plugin": "^3.3.11",
+    "pyright": "1.1.413",
+    "typescript": "5.9.3",
+    "typescript-language-server": "6.0.0",
+    "yaml-language-server": "1.24.0"
+  }
+}

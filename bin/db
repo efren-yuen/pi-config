@@ -1,0 +1,143 @@
+#!/usr/bin/env node
+/**
+ * MySQL 只读 CLI：通过固定的 mycli 提供受限查询能力。
+ * 词法检查不是数据库权限隔离，实际账号仍必须是最小权限只读账号。
+ */
+
+const { spawn } = require("node:child_process");
+const fs = require("node:fs");
+
+const MYCLI_PATH = "/home/efren/.local/bin/mycli";
+const TIMEOUT_MS = 30_000;
+const MAX_OUTPUT_BYTES = 1_048_576;
+const MAX_SQL_LENGTH = 100_000;
+const COMMANDS = new Set(["tables", "schema", "query", "explain"]);
+
+const USAGE = `用法:
+  /home/efren/.pi/agent/bin/db mysql tables
+  /home/efren/.pi/agent/bin/db mysql schema <table>
+  /home/efren/.pi/agent/bin/db mysql query '<SQL>'
+  /home/efren/.pi/agent/bin/db mysql explain '<SELECT SQL>'
+
+选项:
+  -h, --help  显示本帮助
+
+说明:
+  仅支持只读操作；连接认证使用 mycli 的既有机制，不要把密码放入命令行。`;
+
+function usageError(message) {
+	throw new Error(message);
+}
+
+function parseArgs(argv) {
+	if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "-h")) return { help: true };
+	if (argv.length < 2) usageError("需要指定 mysql 引擎和命令");
+	if (argv[0] !== "mysql") usageError("只支持 mysql 引擎");
+	const [command, value] = argv.slice(1);
+	if (!COMMANDS.has(command)) usageError(`未知命令: ${command ?? ""}`);
+	if (command === "tables" && argv.length !== 2) usageError("tables 不接受参数");
+	if (command === "schema" && (argv.length !== 3 || !validateTableName(value))) usageError("schema 需要一个简单表名");
+	if ((command === "query" || command === "explain") && (argv.length !== 3 || !value || value.startsWith("-"))) usageError(`${command} 需要一条 SQL`);
+	return { help: false, engine: "mysql", command, value };
+}
+
+function validateTableName(name) {
+	return typeof name === "string" && /^[A-Za-z0-9_$]+$/.test(name) && name.length <= 256;
+}
+
+function normalizeSql(sql) {
+	if (typeof sql !== "string") usageError("SQL 必须是字符串");
+	if (sql.length === 0 || sql.length > MAX_SQL_LENGTH || /[\u0000-\u001f\u007f]/.test(sql)) usageError("SQL 为空、过长或包含控制字符");
+	const trimmed = sql.trim();
+	if (!trimmed) usageError("SQL 不能为空");
+	if (/--|#|\/\*|\*\//.test(trimmed)) usageError("不允许 SQL 注释");
+	const withoutFinalSemicolon = trimmed.endsWith(";") ? trimmed.slice(0, -1).trim() : trimmed;
+	if (!withoutFinalSemicolon || withoutFinalSemicolon.includes(";")) usageError("不允许多语句 SQL");
+	return withoutFinalSemicolon;
+}
+
+function validateReadOnlySql(sql, mode = "query") {
+	const normalized = normalizeSql(sql);
+	const dangerous = /\b(?:INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|RENAME|GRANT|REVOKE|CALL|SET|USE|KILL|LOAD\s+DATA|HANDLER|LOCK|UNLOCK|START\s+TRANSACTION|BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE)\b|INTO\s+(?:OUTFILE|DUMPFILE)|LOAD_FILE\s*\(|FOR\s+UPDATE\b/i;
+	if (dangerous.test(normalized)) usageError("检测到不允许的写入或高风险 SQL");
+	if (mode === "explain") {
+		if (!/^SELECT\b/i.test(normalized)) usageError("explain 只接受 SELECT");
+	} else if (!/^(?:SELECT|SHOW|DESCRIBE|DESC)\b/i.test(normalized)) {
+		usageError("query 只接受 SELECT、SHOW、DESCRIBE 或 DESC");
+	}
+	return normalized;
+}
+
+function buildSql(command, value) {
+	if (command === "tables") return "SHOW TABLES";
+	if (command === "schema") {
+		if (!validateTableName(value)) usageError("schema 需要一个简单表名");
+		return `SHOW CREATE TABLE \`${value}\``;
+	}
+	if (command === "query") return validateReadOnlySql(value, "query");
+	if (command === "explain") return `EXPLAIN ${validateReadOnlySql(value, "explain")}`;
+	usageError(`未知命令: ${command ?? ""}`);
+}
+
+function buildMycliArgs(sql) {
+	return ["--noninteractive", "--execute", sql];
+}
+
+function runMycli(sql) {
+	return new Promise((resolve, reject) => {
+		if (typeof sql !== "string" || !sql) return reject(new Error("SQL 不能为空"));
+		if (!fs.existsSync(MYCLI_PATH)) return reject(new Error(`找不到 mycli: ${MYCLI_PATH}`));
+		const child = spawn(MYCLI_PATH, buildMycliArgs(sql), {
+			shell: false,
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		let outputBytes = 0;
+		let stdout = "";
+		let stderr = "";
+		let settled = false;
+		const finish = (callback, value) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			callback(value);
+		};
+		const timer = setTimeout(() => {
+			child.kill("SIGTERM");
+			finish(reject, new Error(`mycli 超时（${TIMEOUT_MS / 1000}s）`));
+		}, TIMEOUT_MS);
+		const collect = (chunk, target) => {
+			outputBytes += chunk.byteLength;
+			if (outputBytes > MAX_OUTPUT_BYTES) {
+				child.kill("SIGTERM");
+				finish(reject, new Error(`输出超过上限（${MAX_OUTPUT_BYTES} bytes）`));
+				return;
+			}
+			if (target === "stdout") stdout += chunk.toString();
+			else stderr += chunk.toString();
+		};
+		child.stdout.on("data", (chunk) => collect(chunk, "stdout"));
+		child.stderr.on("data", (chunk) => collect(chunk, "stderr"));
+		child.on("error", (error) => finish(reject, new Error(`mycli 执行失败: ${error.message}`)));
+		child.on("close", (code) => {
+			if (settled) return;
+			if (code !== 0) return finish(reject, new Error(`mycli 返回 ${code}: ${stderr.slice(0, 500)}`));
+			finish(resolve, { stdout, stderr });
+		});
+	});
+}
+
+async function main() {
+	try {
+		const parsed = parseArgs(process.argv.slice(2));
+		if (parsed.help) return process.stdout.write(`${USAGE}\n`);
+		const sql = buildSql(parsed.command, parsed.value);
+		const result = await runMycli(sql);
+		process.stdout.write(result.stdout);
+	} catch (error) {
+		process.stderr.write(`db: ${error.message}\n`);
+		process.exitCode = 1;
+	}
+}
+
+module.exports = { MYCLI_PATH, TIMEOUT_MS, MAX_OUTPUT_BYTES, parseArgs, validateTableName, validateReadOnlySql, buildSql, buildMycliArgs, runMycli };
+if (require.main === module) main();

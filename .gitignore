@@ -1,0 +1,16 @@
+# pi 本机凭据与状态
+/auth.json
+/trust.json
+/models-store.json
+/sessions/
+
+# 运行日志与下载/安装产物
+/lsp/logs/
+/lsp/data/
+/lsp/servers/node_modules/
+/lsp/servers/jdtls/
+/lsp/servers/lua-language-server/
+/bin/fd
+
+# 本机其他工具配置
+/.claude/

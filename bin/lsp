@@ -1,0 +1,1583 @@
+#!/usr/bin/env node
+/**
+ * 语言无关的 LSP 客户端 + 常驻 daemon，给 pi 补上诊断和符号导航能力。
+ *
+ * 为什么要 daemon：LSP 是有状态协议，initialize 握手加工作区索引很贵 ——
+ * jdtls 导入一个 Spring Boot 项目要几十秒到几分钟。daemon 按 (服务器, 工作区根) 常驻，
+ * 主 Agent 和所有 subagent 进程共用同一个热实例。
+ *
+ * 加一门语言 = 在 BUILTIN_SERVERS 里加一条，协议层不含任何语言特定逻辑。
+ */
+
+const fs = require("node:fs");
+const os = require("node:os");
+const net = require("node:net");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const { spawn } = require("node:child_process");
+const { pathToFileURL, fileURLToPath } = require("node:url");
+
+const AGENT_DIR = path.join(os.homedir(), ".pi", "agent");
+const LSP_HOME = path.join(AGENT_DIR, "lsp");
+const SERVERS_DIR = path.join(LSP_HOME, "servers");
+const DATA_DIR = path.join(LSP_HOME, "data");
+const LOG_DIR = path.join(LSP_HOME, "logs");
+const CONFIG_FILE = path.join(LSP_HOME, "servers.json");
+const SOCK_DIR = path.join(process.env.XDG_RUNTIME_DIR || os.tmpdir(), "pi-lsp");
+const SELF = path.join(AGENT_DIR, "bin", "lsp");
+
+const NODE_BIN = path.join(SERVERS_DIR, "node_modules", ".bin");
+const JDTLS_DIR = path.join(SERVERS_DIR, "jdtls");
+const LUA_DIR = path.join(SERVERS_DIR, "lua-language-server");
+
+/** daemon 空闲多久自动退出。PI_LSP_IDLE_MS 只为测试用，正常不需要设。 */
+const IDLE_TIMEOUT_MS = Number(process.env.PI_LSP_IDLE_MS) || 30 * 60 * 1000;
+/** 单次 LSP 请求的默认超时。 */
+const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
+/** 等待服务器就绪的默认超时；jdtls 首次导入很慢，单独放大。 */
+const DEFAULT_READY_TIMEOUT_MS = 60_000;
+const SLOW_READY_TIMEOUT_MS = 10 * 60 * 1000;
+/**
+ * 最后一批推送诊断之后再静默这么久才算收齐；每来一批都重新计时。
+ * 某个文件在本 daemon 里第一次被诊断时用长的：jdtls 会先发一批只精确到行的粗粒度诊断，
+ * 实测约 1.2 秒后才发带准确列号的那批，静默期必须留够余量。
+ * 同一文件之后的查询只会有一批，用短的，好让编辑后的自动诊断保持跟手。
+ */
+const DIAGNOSTIC_SETTLE_COLD_MS = 3000;
+const DIAGNOSTIC_SETTLE_WARM_MS = 600;
+
+/** 本机四套 JDK：jdtls 进程自己跑在 21 上，项目按 pom/gradle 声明的版本各选各的。 */
+const JAVA_RUNTIMES = [
+	{ name: "JavaSE-1.8", path: "/usr/lib/jvm/java-8-openjdk" },
+	{ name: "JavaSE-11", path: "/usr/lib/jvm/java-11-openjdk" },
+	{ name: "JavaSE-17", path: "/usr/lib/jvm/java-17-openjdk" },
+	{ name: "JavaSE-21", path: "/usr/lib/jvm/java-21-openjdk", default: true },
+];
+const JDTLS_JAVA = "/usr/lib/jvm/java-21-openjdk/bin/java";
+
+/**
+ * 内置服务器注册表。字段含义见 skills/lsp/SKILL.md；servers.json 可逐项覆盖。
+ * command 为函数时表示启动参数依赖工作区（目前只有 jdtls 需要按工作区分配 -data 目录）。
+ */
+const BUILTIN_SERVERS = {
+	java: {
+		extensions: [".java"],
+		languageId: "java",
+		rootMarkers: ["pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", ".project"],
+		command: (root) => {
+			const launcher = findJdtlsLauncher();
+			if (!launcher) return null;
+			return [
+				JDTLS_JAVA,
+				"-jar", launcher,
+				"-configuration", path.join(JDTLS_DIR, "config_linux"),
+				"-data", jdtlsDataDir(root),
+				"-Declipse.application=org.eclipse.jdt.ls.core.id1",
+				"-Dosgi.bundles.defaultStartLevel=4",
+				"-Declipse.product=org.eclipse.jdt.ls.core.product",
+				"-Dlog.level=WARNING",
+				"-Xms256m", "-Xmx2G",
+				"--add-modules=ALL-SYSTEM",
+				"--add-opens", "java.base/java.util=ALL-UNNAMED",
+				"--add-opens", "java.base/java.lang=ALL-UNNAMED",
+			];
+		},
+		initialization: {
+			settings: { java: javaSettings() },
+			extendedClientCapabilities: { progressReportProvider: false, classFileContentsSupport: true },
+		},
+		settings: { java: javaSettings() },
+		readySignal: { method: "language/status", match: { type: "ServiceReady" } },
+		readyTimeoutMs: SLOW_READY_TIMEOUT_MS,
+	},
+	/**
+	 * .vue 一并由 typescript-language-server 处理，靠 @vue/typescript-plugin 支持单文件组件。
+	 * 不用 @vue/language-server：它 3.x 起只有 hybrid 模式，会把 TypeScript 那一半以
+	 * tsserver/request 通知的形式甩给客户端，要求宿主自己跑 tsserver 并代理协议。
+	 * 走插件这条路还有个好处：.ts 文件 import .vue 时也能正确解析，不会误报找不到模块。
+	 */
+	typescript: {
+		extensions: [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".vue"],
+		languageId: (file) => {
+			if (file.endsWith(".vue")) return "vue";
+			return /\.tsx?$|\.mts$|\.cts$/.test(file) ? "typescript" : "javascript";
+		},
+		rootMarkers: ["tsconfig.json", "jsconfig.json", "package.json"],
+		command: () => [nodeServer("typescript-language-server"), "--stdio"],
+		initialization: (root) => ({
+			tsserver: { path: resolveTsserver(root) },
+			plugins: [
+				{
+					name: "@vue/typescript-plugin",
+					location: path.join(SERVERS_DIR, "node_modules", "@vue", "typescript-plugin"),
+					languages: ["vue"],
+				},
+			],
+		}),
+	},
+	python: {
+		extensions: [".py", ".pyi"],
+		languageId: "python",
+		rootMarkers: ["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "Pipfile", "pyrightconfig.json"],
+		command: () => [nodeServer("pyright-langserver"), "--stdio"],
+	},
+	yaml: {
+		extensions: [".yaml", ".yml"],
+		languageId: "yaml",
+		rootMarkers: ["package.json", ".git"],
+		command: () => [nodeServer("yaml-language-server"), "--stdio"],
+	},
+	lua: {
+		extensions: [".lua"],
+		languageId: "lua",
+		rootMarkers: [".luarc.json", ".luarc.jsonc", "stylua.toml", ".stylua.toml"],
+		command: () => [path.join(LUA_DIR, "bin", "lua-language-server")],
+	},
+	cpp: {
+		extensions: [".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"],
+		languageId: (file) => (/\.c$|\.h$/.test(file) ? "c" : "cpp"),
+		rootMarkers: ["compile_commands.json", "compile_flags.txt", "CMakeLists.txt", "Makefile"],
+		command: () => ["clangd", "--background-index", "--clang-tidy"],
+	},
+};
+
+/** jdtls 的 java.* 设置，initialize 和 didChangeConfiguration 都要用同一份。 */
+function javaSettings() {
+	return {
+		configuration: { runtimes: JAVA_RUNTIMES, updateBuildConfiguration: "automatic" },
+		import: { maven: { enabled: true }, gradle: { enabled: true } },
+		autobuild: { enabled: true },
+		maxConcurrentBuilds: 1,
+		errors: { incompleteClasspath: { severity: "warning" } },
+	};
+}
+
+function findJdtlsLauncher() {
+	const plugins = path.join(JDTLS_DIR, "plugins");
+	let entries;
+	try {
+		entries = fs.readdirSync(plugins);
+	} catch {
+		return null;
+	}
+	const jar = entries.find((name) => /^org\.eclipse\.equinox\.launcher_.*\.jar$/.test(name));
+	return jar ? path.join(plugins, jar) : null;
+}
+
+/** jdtls 的工作区元数据目录按工作区根隔离并持久化，第二次启动就不必重新解析 classpath。 */
+function jdtlsDataDir(root) {
+	return path.join(DATA_DIR, "jdtls", hash(root));
+}
+
+function nodeServer(name) {
+	return path.join(NODE_BIN, name);
+}
+
+/** tsserver 优先用项目自己的那份，保证类型检查结果和项目构建一致。 */
+function resolveTsserver(root) {
+	const projectTsserver = path.join(root, "node_modules", "typescript", "lib", "tsserver.js");
+	if (fs.existsSync(projectTsserver)) return projectTsserver;
+	return path.join(SERVERS_DIR, "node_modules", "typescript", "lib", "tsserver.js");
+}
+
+function hash(value) {
+	return crypto.createHash("sha1").update(value).digest("hex").slice(0, 16);
+}
+
+// ---------------------------------------------------------------- 配置解析
+
+function readJson(file) {
+	try {
+		return JSON.parse(fs.readFileSync(file, "utf8"));
+	} catch {
+		return null;
+	}
+}
+
+/** 后面的对象覆盖前面的，同为普通对象时递归合并。 */
+function deepMerge(base, override) {
+	if (!isPlainObject(base) || !isPlainObject(override)) return override === undefined ? base : override;
+	const out = { ...base };
+	for (const [key, value] of Object.entries(override)) {
+		out[key] = isPlainObject(value) && isPlainObject(base[key]) ? deepMerge(base[key], value) : value;
+	}
+	return out;
+}
+
+function isPlainObject(value) {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * 合并三层配置：内置默认 < ~/.pi/agent/lsp/servers.json < <工作区>/.pi/lsp.json。
+ * 项目级放最后，老项目要指定 JDK 之类的就写在那里。
+ */
+function loadConfig(projectRoot) {
+	const global = readJson(CONFIG_FILE) ?? {};
+	const project = projectRoot ? readJson(path.join(projectRoot, ".pi", "lsp.json")) ?? {} : {};
+	const merged = { autoDiagnostics: true, servers: {} };
+	merged.autoDiagnostics = project.autoDiagnostics ?? global.autoDiagnostics ?? true;
+	for (const id of new Set([...Object.keys(BUILTIN_SERVERS), ...Object.keys(global.servers ?? {}), ...Object.keys(project.servers ?? {})])) {
+		merged.servers[id] = deepMerge(deepMerge(BUILTIN_SERVERS[id] ?? {}, global.servers?.[id] ?? {}), project.servers?.[id] ?? {});
+	}
+	return merged;
+}
+
+/** 从文件所在目录向上找 rootMarkers，找不到就退回文件所在目录。 */
+function findRoot(file, markers) {
+	let dir = path.dirname(path.resolve(file));
+	const stop = path.parse(dir).root;
+	const seen = [];
+	for (;;) {
+		seen.push(dir);
+		for (const marker of markers ?? []) {
+			if (fs.existsSync(path.join(dir, marker))) return dir;
+		}
+		if (dir === stop) break;
+		dir = path.dirname(dir);
+	}
+	return seen[0];
+}
+
+/** 按扩展名挑服务器。返回 { id, config, root }。 */
+function resolveServer(file, explicitId) {
+	const abs = path.resolve(file);
+	const ext = path.extname(abs).toLowerCase();
+	// 先用不带项目层的配置挑出服务器，拿到 root 之后再读项目级配置重新合并。
+	const bootstrap = loadConfig(null);
+	let id = explicitId;
+	if (!id) {
+		id = Object.keys(bootstrap.servers).find((key) => {
+			const entry = bootstrap.servers[key];
+			return !entry.disabled && (entry.extensions ?? []).includes(ext);
+		});
+	}
+	if (!id) throw new UserError(`没有为 ${ext || abs} 配置语言服务器。用 'lsp servers' 看已注册的服务器。`);
+	const entry0 = bootstrap.servers[id];
+	if (!entry0) throw new UserError(`未知的服务器 id: ${id}`);
+	const root = findRoot(abs, entry0.rootMarkers);
+	const config = loadConfig(root);
+	const entry = config.servers[id];
+	if (entry.disabled) throw new UserError(`服务器 ${id} 已在配置里禁用。`);
+	return { id, config: entry, root, autoDiagnostics: config.autoDiagnostics };
+}
+
+/** 内置 command 是函数（依赖工作区），配置文件覆盖的是数组。 */
+function resolveCommand(entry, root) {
+	const builtin = BUILTIN_SERVERS[entry.__id];
+	if (Array.isArray(entry.command)) return entry.command;
+	if (typeof entry.command === "function") return entry.command(root);
+	if (builtin && typeof builtin.command === "function") return builtin.command(root);
+	return null;
+}
+
+/** initialization 也允许是 (root) => object，因为 tsserver 路径要按工作区解析。 */
+function resolveInitialization(entry, root) {
+	const value = entry.initialization;
+	if (typeof value === "function") return value(root);
+	return value ?? {};
+}
+
+function languageIdFor(entry, file) {
+	const value = entry.languageId;
+	if (typeof value === "function") return value(file);
+	return value ?? "plaintext";
+}
+
+class UserError extends Error {}
+
+// ---------------------------------------------------------------- LSP 协议层
+
+/**
+ * Content-Length 分帧的 JSON-RPC 读取器。LSP 的头用 \r\n\r\n 结束，
+ * 正文按字节数截取（必须按 Buffer 而不是字符串长度，否则多字节字符会错位）。
+ */
+function createMessageReader(stream, onMessage) {
+	let buffer = Buffer.alloc(0);
+	stream.on("data", (chunk) => {
+		buffer = Buffer.concat([buffer, chunk]);
+		for (;;) {
+			const headerEnd = buffer.indexOf("\r\n\r\n");
+			if (headerEnd < 0) return;
+			const header = buffer.subarray(0, headerEnd).toString("ascii");
+			const match = /content-length:\s*(\d+)/i.exec(header);
+			if (!match) {
+				buffer = buffer.subarray(headerEnd + 4);
+				continue;
+			}
+			const length = Number(match[1]);
+			const start = headerEnd + 4;
+			if (buffer.length < start + length) return;
+			const body = buffer.subarray(start, start + length).toString("utf8");
+			buffer = buffer.subarray(start + length);
+			let parsed;
+			try {
+				parsed = JSON.parse(body);
+			} catch {
+				continue;
+			}
+			onMessage(parsed);
+		}
+	});
+}
+
+function writeMessage(stream, message) {
+	const body = Buffer.from(JSON.stringify(message), "utf8");
+	stream.write(`Content-Length: ${body.length}\r\n\r\n`);
+	stream.write(body);
+}
+
+const ERROR_METHOD_NOT_FOUND = -32601;
+
+/**
+ * 一个语言服务器的连接。负责握手、文档同步、诊断收集，
+ * 以及——最容易漏的一点——应答服务器主动发来的请求。
+ */
+class LspClient {
+	constructor({ id, entry, root, log }) {
+		this.id = id;
+		this.entry = entry;
+		this.root = root;
+		this.log = log;
+		this.nextId = 1;
+		this.pending = new Map();
+		/** uri -> { text, languageId } */
+		this.openDocs = new Map();
+		/** uri -> { diagnostics, receivedAt } */
+		this.diagnostics = new Map();
+		/** 已经完整收齐过诊断的文件，后续查询可以用较短的静默期。 */
+		this.settledUris = new Set();
+		this.capabilities = {};
+		this.ready = false;
+		this.readyWaiters = [];
+		this.exited = null;
+	}
+
+	async start() {
+		const command = resolveCommand(this.entry, this.root);
+		if (!command || !command[0]) {
+			throw new UserError(`服务器 ${this.id} 未安装。跑 'lsp install ${this.id}' 装它，或在 servers.json 里指定 command。`);
+		}
+		if (command[0].includes("/") && !fs.existsSync(command[0])) {
+			throw new UserError(`服务器 ${this.id} 的可执行文件不存在：${command[0]}。跑 'lsp install ${this.id}'。`);
+		}
+		this.log(`spawn: ${command.join(" ")}`);
+		this.proc = spawn(command[0], command.slice(1), {
+			cwd: this.root,
+			env: { ...process.env, ...(this.entry.env ?? {}) },
+			stdio: ["pipe", "pipe", "pipe"],
+		});
+		this.proc.on("error", (err) => {
+			this.exited = `启动失败: ${err.message}`;
+			this.failAllPending(this.exited);
+		});
+		this.proc.on("exit", (code, signal) => {
+			this.exited = `语言服务器已退出 (code=${code} signal=${signal})`;
+			this.failAllPending(this.exited);
+		});
+		this.proc.stderr.on("data", (chunk) => this.log(`stderr: ${chunk.toString().trimEnd()}`));
+		createMessageReader(this.proc.stdout, (msg) => this.handleMessage(msg));
+
+		const result = await this.request("initialize", {
+			processId: process.pid,
+			rootPath: this.root,
+			rootUri: pathToFileURL(this.root).href,
+			workspaceFolders: [{ uri: pathToFileURL(this.root).href, name: path.basename(this.root) }],
+			initializationOptions: resolveInitialization(this.entry, this.root),
+			capabilities: CLIENT_CAPABILITIES,
+		}, { timeoutMs: this.readyTimeout() });
+		this.capabilities = result?.capabilities ?? {};
+		this.notify("initialized", {});
+		if (this.entry.settings) {
+			this.notify("workspace/didChangeConfiguration", { settings: this.entry.settings });
+		}
+		// 没声明 readySignal 的服务器，initialize 返回即可用。
+		if (!this.entry.readySignal) this.markReady();
+	}
+
+	readyTimeout() {
+		return this.entry.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
+	}
+
+	markReady() {
+		if (this.ready) return;
+		this.ready = true;
+		for (const resolve of this.readyWaiters) resolve();
+		this.readyWaiters = [];
+		this.log("ready");
+	}
+
+	/** 等服务器真正可以回答问题。超时不算失败——降级返回，由调用方在结果里带警告。 */
+	waitReady(timeoutMs) {
+		if (this.ready) return Promise.resolve(true);
+		return new Promise((resolve) => {
+			const timer = setTimeout(() => resolve(false), timeoutMs ?? this.readyTimeout());
+			this.readyWaiters.push(() => {
+				clearTimeout(timer);
+				resolve(true);
+			});
+		});
+	}
+
+	failAllPending(reason) {
+		for (const [, entry] of this.pending) {
+			clearTimeout(entry.timer);
+			entry.reject(new Error(reason));
+		}
+		this.pending.clear();
+		for (const resolve of this.readyWaiters) resolve();
+		this.readyWaiters = [];
+	}
+
+	request(method, params, { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS } = {}) {
+		if (this.exited) return Promise.reject(new Error(this.exited));
+		const id = this.nextId++;
+		return new Promise((resolve, reject) => {
+			const timer = setTimeout(() => {
+				this.pending.delete(id);
+				reject(new Error(`${method} 超时（${timeoutMs}ms）`));
+			}, timeoutMs);
+			this.pending.set(id, { resolve, reject, timer });
+			writeMessage(this.proc.stdin, { jsonrpc: "2.0", id, method, params });
+		});
+	}
+
+	notify(method, params) {
+		if (this.exited) return;
+		writeMessage(this.proc.stdin, { jsonrpc: "2.0", method, params });
+	}
+
+	respond(id, result) {
+		writeMessage(this.proc.stdin, { jsonrpc: "2.0", id, result });
+	}
+
+	respondError(id, code, message) {
+		writeMessage(this.proc.stdin, { jsonrpc: "2.0", id, error: { code, message } });
+	}
+
+	handleMessage(msg) {
+		if (msg.id !== undefined && msg.method === undefined) {
+			const entry = this.pending.get(msg.id);
+			if (!entry) return;
+			clearTimeout(entry.timer);
+			this.pending.delete(msg.id);
+			if (msg.error) entry.reject(new Error(`${msg.error.message} (code=${msg.error.code})`));
+			else entry.resolve(msg.result);
+			return;
+		}
+		if (msg.method !== undefined && msg.id !== undefined) {
+			this.handleServerRequest(msg);
+			return;
+		}
+		if (msg.method !== undefined) this.handleNotification(msg);
+	}
+
+	/**
+	 * 服务器→客户端的请求必须一律应答，否则服务器会一直等着，
+	 * 表现成我们这边的「请求超时」，极难排查。未知方法回 MethodNotFound，不静默丢弃。
+	 */
+	handleServerRequest(msg) {
+		switch (msg.method) {
+			case "client/registerCapability":
+			case "client/unregisterCapability":
+			case "window/workDoneProgress/create":
+			case "window/showDocument":
+				this.respond(msg.id, null);
+				return;
+			case "workspace/configuration": {
+				const items = msg.params?.items ?? [];
+				this.respond(msg.id, items.map((item) => this.configurationFor(item.section)));
+				return;
+			}
+			case "workspace/applyEdit":
+				// 我们是只读客户端，从不代表服务器改文件。
+				this.respond(msg.id, { applied: false, failureReason: "pi-lsp is read-only" });
+				return;
+			case "workspace/executeClientCommand":
+				this.respond(msg.id, null);
+				return;
+			case "window/showMessageRequest":
+				this.log(`showMessageRequest: ${msg.params?.message ?? ""}`);
+				this.respond(msg.id, null);
+				return;
+			default:
+				this.log(`未处理的服务器请求: ${msg.method}`);
+				this.respondError(msg.id, ERROR_METHOD_NOT_FOUND, `pi-lsp does not implement ${msg.method}`);
+		}
+	}
+
+	/** workspace/configuration 按 section 取配置，取不到回 null（协议允许）。 */
+	configurationFor(section) {
+		if (!section) return this.entry.settings ?? null;
+		let node = this.entry.settings ?? {};
+		for (const part of section.split(".")) {
+			if (!isPlainObject(node) || !(part in node)) return null;
+			node = node[part];
+		}
+		return node;
+	}
+
+	handleNotification(msg) {
+		if (msg.method === "textDocument/publishDiagnostics") {
+			const uri = msg.params?.uri;
+			if (uri) {
+				const list = msg.params.diagnostics ?? [];
+				this.diagnostics.set(uri, { diagnostics: list, receivedAt: Date.now() });
+				this.log(`publishDiagnostics: ${list.length} 条 ${uri}`);
+			}
+			return;
+		}
+		if (msg.method === "window/logMessage" || msg.method === "window/showMessage") {
+			this.log(`${msg.method}: ${msg.params?.message ?? ""}`);
+		}
+		const signal = this.entry.readySignal;
+		if (signal && msg.method === signal.method) {
+			const match = signal.match ?? {};
+			const ok = Object.entries(match).every(([key, value]) => msg.params?.[key] === value);
+			if (ok) this.markReady();
+		}
+		if (signal && msg.method === "language/status") this.log(`status: ${JSON.stringify(msg.params)}`);
+	}
+
+	/**
+	 * 位置类请求前先同步文档。内容变了就 didClose + didOpen 全量重开 ——
+	 * 对所有服务器都合法，不必按 textDocumentSync 的 full/incremental 分别处理。
+	 */
+	syncDocument(file) {
+		const abs = path.resolve(file);
+		const uri = pathToFileURL(abs).href;
+		let text;
+		try {
+			text = fs.readFileSync(abs, "utf8");
+		} catch (err) {
+			throw new UserError(`读不了文件 ${abs}: ${err.message}`);
+		}
+		const current = this.openDocs.get(uri);
+		if (current && current.text === text) return { uri, reopened: false };
+		const languageId = languageIdFor(this.entry, abs);
+		if (current) this.notify("textDocument/didClose", { textDocument: { uri } });
+		this.diagnostics.delete(uri);
+		this.notify("textDocument/didOpen", {
+			textDocument: { uri, languageId, version: (current?.version ?? 0) + 1, text },
+		});
+		this.openDocs.set(uri, { text, languageId, version: (current?.version ?? 0) + 1 });
+		return { uri, reopened: true };
+	}
+
+	async shutdown() {
+		try {
+			await this.request("shutdown", null, { timeoutMs: 3000 });
+			this.notify("exit", null);
+		} catch {
+			// 服务器不配合就直接杀。
+		}
+		try {
+			this.proc?.kill("SIGTERM");
+		} catch {}
+	}
+}
+
+/** 声明得保守些：只声明我们真的会用到的能力，服务器才不会推我们处理不了的东西。 */
+const CLIENT_CAPABILITIES = {
+	workspace: {
+		configuration: true,
+		didChangeConfiguration: { dynamicRegistration: true },
+		workspaceFolders: true,
+		symbol: { symbolKind: { valueSet: Array.from({ length: 26 }, (_, i) => i + 1) } },
+		applyEdit: false,
+		executeCommand: {},
+	},
+	textDocument: {
+		synchronization: { dynamicRegistration: false, didSave: false, willSave: false },
+		publishDiagnostics: { relatedInformation: true, versionSupport: false },
+		diagnostic: { dynamicRegistration: false, relatedDocumentSupport: false },
+		hover: { contentFormat: ["markdown", "plaintext"] },
+		definition: { linkSupport: true },
+		typeDefinition: { linkSupport: true },
+		implementation: { linkSupport: true },
+		references: {},
+		documentSymbol: { hierarchicalDocumentSymbolSupport: true },
+		callHierarchy: { dynamicRegistration: false },
+		codeAction: {},
+	},
+	window: { workDoneProgress: true, showMessage: {}, showDocument: { support: false } },
+	general: { positionEncodings: ["utf-16"] },
+};
+
+// ---------------------------------------------------------------- 查询操作
+
+/** 位置参数三选一：显式行列、或给符号名让我们自己查。行列进来时已是 0-based。 */
+async function resolvePosition(client, params) {
+	const { uri } = client.syncDocument(params.file);
+	if (params.symbol) {
+		const symbols = await client.request("textDocument/documentSymbol", { textDocument: { uri } });
+		const found = findSymbol(symbols ?? [], params.symbol);
+		if (!found) {
+			const names = collectSymbolNames(symbols ?? []).slice(0, 30);
+			const hint = names.length > 0 ? ` 该文件里的符号：${names.join("、")}` : "";
+			throw new UserError(`在 ${params.file} 里找不到符号 ${params.symbol}。${hint}`);
+		}
+		return { uri, position: found };
+	}
+	if (params.line === undefined) throw new UserError("需要 --line/--col，或者用 --symbol <名字>。");
+	return { uri, position: { line: params.line, character: params.col ?? 0 } };
+}
+
+/**
+ * documentSymbol 有层级式和扁平式两种返回，都要能找。
+ * jdtls、clangd 这类服务器的方法名带签名（countOrders()、addOrder(String)），
+ * 所以精确名字匹配不上时，再按左括号前的名字匹配一次。
+ */
+function findSymbol(symbols, name) {
+	const exact = [];
+	const byBaseName = [];
+	const walk = (list) => {
+		for (const symbol of list ?? []) {
+			const range = symbol.selectionRange ?? symbol.range ?? symbol.location?.range;
+			if (range) {
+				if (symbol.name === name) exact.push(range.start);
+				else if (symbol.name.split("(")[0] === name) byBaseName.push(range.start);
+			}
+			if (symbol.children) walk(symbol.children);
+		}
+	};
+	walk(symbols);
+	return exact[0] ?? byBaseName[0] ?? null;
+}
+
+/** 报错时把文件里实际有哪些符号列出来，省得调用方再查一次。 */
+function collectSymbolNames(symbols, out = []) {
+	for (const symbol of symbols ?? []) {
+		out.push(symbol.name);
+		if (symbol.children) collectSymbolNames(symbol.children, out);
+	}
+	return out;
+}
+
+/** definition/references 等返回 Location | Location[] | LocationLink[]，统一成 Location[]。 */
+function toLocations(result) {
+	if (!result) return [];
+	const list = Array.isArray(result) ? result : [result];
+	return list
+		.map((item) => {
+			if (item.uri && item.range) return { uri: item.uri, range: item.range };
+			if (item.targetUri) return { uri: item.targetUri, range: item.targetSelectionRange ?? item.targetRange };
+			return null;
+		})
+		.filter(Boolean);
+}
+
+const OPERATIONS = {
+	async diag(client, params) {
+		const { uri, reopened } = client.syncDocument(params.file);
+		const timeoutMs = params.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+		const provider = client.capabilities?.diagnosticProvider;
+		// 文档内容没变、服务器早就推过诊断了：直接用缓存，否则会白等一个不会再来的推送。
+		if (!provider && !reopened && client.diagnostics.has(uri)) {
+			return { uri, diagnostics: client.diagnostics.get(uri).diagnostics, mode: "cached" };
+		}
+		if (provider) {
+			// 拉取式（LSP 3.17）：确定性好，不用猜服务器什么时候算完。
+			const result = await client.request("textDocument/diagnostic", { textDocument: { uri } }, { timeoutMs });
+			return { uri, diagnostics: result?.items ?? [], mode: "pull" };
+		}
+		const settleMs = client.settledUris.has(uri) ? DIAGNOSTIC_SETTLE_WARM_MS : DIAGNOSTIC_SETTLE_COLD_MS;
+		const diagnostics = await waitForPushedDiagnostics(client, uri, timeoutMs, settleMs);
+		if (!diagnostics.timedOut) client.settledUris.add(uri);
+		return { uri, diagnostics: diagnostics.list, mode: "push", timedOut: diagnostics.timedOut };
+	},
+
+	async hover(client, params) {
+		const { uri, position } = await resolvePosition(client, params);
+		const result = await client.request("textDocument/hover", { textDocument: { uri }, position });
+		return { hover: result };
+	},
+
+	async def(client, params) {
+		const { uri, position } = await resolvePosition(client, params);
+		const result = await client.request("textDocument/definition", { textDocument: { uri }, position });
+		return { locations: toLocations(result) };
+	},
+
+	async refs(client, params) {
+		const { uri, position } = await resolvePosition(client, params);
+		const result = await client.request("textDocument/references", {
+			textDocument: { uri },
+			position,
+			context: { includeDeclaration: true },
+		});
+		return { locations: toLocations(result) };
+	},
+
+	async impl(client, params) {
+		const { uri, position } = await resolvePosition(client, params);
+		const result = await client.request("textDocument/implementation", { textDocument: { uri }, position });
+		return { locations: toLocations(result) };
+	},
+
+	async symbols(client, params) {
+		const { uri } = client.syncDocument(params.file);
+		const result = await client.request("textDocument/documentSymbol", { textDocument: { uri } });
+		return { symbols: result ?? [], uri };
+	},
+
+	async search(client, params) {
+		const result = await client.request("workspace/symbol", { query: params.query ?? "" });
+		return { symbols: result ?? [] };
+	},
+
+	async callers(client, params) {
+		const item = await prepareCallHierarchy(client, params);
+		const result = await client.request("callHierarchy/incomingCalls", { item });
+		return { item, calls: (result ?? []).map((entry) => ({ target: entry.from, ranges: entry.fromRanges })) };
+	},
+
+	async callees(client, params) {
+		const item = await prepareCallHierarchy(client, params);
+		const result = await client.request("callHierarchy/outgoingCalls", { item });
+		return { item, calls: (result ?? []).map((entry) => ({ target: entry.to, ranges: entry.fromRanges })) };
+	},
+};
+
+async function prepareCallHierarchy(client, params) {
+	const { uri, position } = await resolvePosition(client, params);
+	const items = await client.request("textDocument/prepareCallHierarchy", { textDocument: { uri }, position });
+	if (!items || items.length === 0) throw new UserError("该位置上没有可用的调用层级项（要指向函数/方法名）。");
+	return items[0];
+}
+
+/**
+ * 推送式诊断：服务器算完才发 publishDiagnostics，没有「算完了」的信号，只能靠静默期判断。
+ *
+ * 关键点是**每来一批就重置静默计时器**：jdtls 会先发一批只精确到行的粗粒度诊断，
+ * 等工作区构建完再发一批带准确列号的。只在第一批之后固定等一小段的话，
+ * 冷启动时拿到的就是列号全为 1 的那一版。
+ */
+function waitForPushedDiagnostics(client, uri, timeoutMs, settleMs) {
+	const openedAt = Date.now();
+	return new Promise((resolve) => {
+		const deadline = openedAt + timeoutMs;
+		let settleTimer = null;
+		let lastBatchAt = 0;
+		const finish = (timedOut) => {
+			clearInterval(poll);
+			if (settleTimer) clearTimeout(settleTimer);
+			resolve({ list: client.diagnostics.get(uri)?.diagnostics ?? [], timedOut });
+		};
+		const poll = setInterval(() => {
+			const entry = client.diagnostics.get(uri);
+			if (entry && entry.receivedAt >= openedAt && entry.receivedAt !== lastBatchAt) {
+				lastBatchAt = entry.receivedAt;
+				if (settleTimer) clearTimeout(settleTimer);
+				settleTimer = setTimeout(() => finish(false), settleMs);
+			}
+			if (Date.now() > deadline) finish(lastBatchAt === 0);
+		}, 50);
+	});
+}
+
+// ---------------------------------------------------------------- daemon
+
+function socketPath(serverId, root) {
+	return path.join(SOCK_DIR, `${serverId}-${hash(root)}.sock`);
+}
+
+function logPath(serverId, root) {
+	return path.join(LOG_DIR, `${serverId}-${hash(root)}.log`);
+}
+
+/** daemon 进程入口：起一个语言服务器，然后在 unix socket 上收请求。 */
+async function runDaemon(serverId, root) {
+	fs.mkdirSync(SOCK_DIR, { recursive: true });
+	fs.mkdirSync(LOG_DIR, { recursive: true });
+	const sock = socketPath(serverId, root);
+	const logFile = logPath(serverId, root);
+	const logStream = fs.createWriteStream(logFile, { flags: "a" });
+	const log = (line) => logStream.write(`[${new Date().toISOString()}] ${line}\n`);
+
+	const config = loadConfig(root);
+	const entry = config.servers[serverId];
+	if (!entry) {
+		log(`未知服务器 ${serverId}`);
+		process.exit(1);
+	}
+	entry.__id = serverId;
+
+	// 抢 socket：抢不到说明别的 daemon 已经在跑，直接退出让客户端去连它。
+	const server = net.createServer();
+	const bound = await new Promise((resolve) => {
+		server.once("error", (err) => resolve(err.code === "EADDRINUSE" ? "busy" : `error:${err.message}`));
+		server.listen(sock, () => resolve("ok"));
+	});
+	if (bound === "busy") process.exit(0);
+	if (bound !== "ok") {
+		log(`socket 绑定失败: ${bound}`);
+		process.exit(1);
+	}
+
+	const client = new LspClient({ id: serverId, entry, root, log });
+	const started = Date.now();
+	let startError = null;
+	client.start().catch((err) => {
+		startError = err.message;
+		log(`启动失败: ${err.message}`);
+	});
+
+	let idleTimer = null;
+	const resetIdle = () => {
+		if (idleTimer) clearTimeout(idleTimer);
+		idleTimer = setTimeout(async () => {
+			log("空闲超时，退出");
+			await client.shutdown();
+			try { fs.unlinkSync(sock); } catch {}
+			process.exit(0);
+		}, IDLE_TIMEOUT_MS);
+	};
+	resetIdle();
+
+	server.on("connection", (conn) => {
+		resetIdle();
+		let buffer = "";
+		conn.on("data", async (chunk) => {
+			buffer += chunk.toString("utf8");
+			const newline = buffer.indexOf("\n");
+			if (newline < 0) return;
+			const line = buffer.slice(0, newline);
+			buffer = "";
+			let payload;
+			try {
+				payload = JSON.parse(line);
+			} catch (err) {
+				conn.end(JSON.stringify({ ok: false, error: `请求不是合法 JSON: ${err.message}` }) + "\n");
+				return;
+			}
+			const reply = await handleDaemonRequest({ client, payload, serverId, root, started, startError: () => startError, log, sock });
+			conn.end(JSON.stringify(reply) + "\n");
+		});
+		conn.on("error", () => {});
+	});
+
+	process.on("SIGTERM", async () => {
+		await client.shutdown();
+		try { fs.unlinkSync(sock); } catch {}
+		process.exit(0);
+	});
+	log(`daemon 启动: server=${serverId} root=${root} pid=${process.pid}`);
+}
+
+async function handleDaemonRequest(ctx) {
+	const { client, payload, serverId, root, started, startError, sock } = ctx;
+	if (payload.op === "status") {
+		return {
+			ok: true,
+			result: {
+				serverId,
+				root,
+				pid: process.pid,
+				serverPid: client.proc?.pid ?? null,
+				ready: client.ready,
+				uptimeMs: Date.now() - started,
+				openDocs: client.openDocs.size,
+				startError: startError(),
+				logFile: logPath(serverId, root),
+			},
+		};
+	}
+	if (payload.op === "shutdown") {
+		setTimeout(async () => {
+			await client.shutdown();
+			try { fs.unlinkSync(sock); } catch {}
+			process.exit(0);
+		}, 10);
+		return { ok: true, result: { stopped: true, serverId, root } };
+	}
+	const operation = OPERATIONS[payload.op];
+	if (!operation) return { ok: false, error: `未知操作: ${payload.op}` };
+	const err = startError();
+	if (err) return { ok: false, error: err };
+	const readyTimeout = payload.readyTimeoutMs ?? client.readyTimeout();
+	const ready = await client.waitReady(readyTimeout);
+	try {
+		const result = await operation(client, payload);
+		return { ok: true, result: { ...result, serverId, root, ready } };
+	} catch (error) {
+		return { ok: false, error: error.message, serverId, root, ready };
+	}
+}
+
+// ---------------------------------------------------------------- 客户端侧 IPC
+
+function tryConnect(sock, timeoutMs) {
+	return new Promise((resolve) => {
+		const conn = net.createConnection(sock);
+		let settled = false;
+		// 超时定时器必须在连上之后清掉：否则它会在一秒后 destroy 掉正在使用的连接。
+		const timer = setTimeout(() => finish(null), timeoutMs ?? 1000);
+		const onConnect = () => finish(conn);
+		const onError = () => finish(null);
+		function finish(value) {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			conn.off("connect", onConnect);
+			conn.off("error", onError);
+			if (value) conn.on("error", () => {});
+			else conn.destroy();
+			resolve(value);
+		}
+		conn.once("connect", onConnect);
+		conn.once("error", onError);
+	});
+}
+
+function spawnDaemon(serverId, root) {
+	const child = spawn(process.execPath, [SELF, "__daemon", serverId, root], {
+		detached: true,
+		stdio: "ignore",
+		cwd: root,
+	});
+	child.unref();
+}
+
+/** 连不上就拉起 daemon 再轮询。socket 文件残留（daemon 被 kill 掉）时先清掉。 */
+async function daemonRequest(serverId, root, payload, { startTimeoutMs = 30_000 } = {}) {
+	fs.mkdirSync(SOCK_DIR, { recursive: true });
+	const sock = socketPath(serverId, root);
+	let conn = await tryConnect(sock);
+	if (!conn) {
+		if (fs.existsSync(sock)) {
+			try { fs.unlinkSync(sock); } catch {}
+		}
+		spawnDaemon(serverId, root);
+		const deadline = Date.now() + startTimeoutMs;
+		while (!conn && Date.now() < deadline) {
+			await sleep(120);
+			conn = await tryConnect(sock);
+		}
+		if (!conn) throw new UserError(`起不来 ${serverId} 的 daemon。看日志：${logPath(serverId, root)}`);
+	}
+	return new Promise((resolve, reject) => {
+		let buffer = "";
+		conn.on("data", (chunk) => { buffer += chunk.toString("utf8"); });
+		conn.on("end", () => {
+			try {
+				resolve(JSON.parse(buffer.trim()));
+			} catch (err) {
+				reject(new Error(`daemon 返回的不是合法 JSON: ${err.message}`));
+			}
+		});
+		conn.on("error", (err) => reject(err));
+		conn.write(JSON.stringify(payload) + "\n");
+	});
+}
+
+/** 只连不拉起，用于 status/stop —— 不该因为查状态就把服务器启动起来。 */
+async function daemonRequestIfRunning(serverId, root, payload) {
+	const sock = socketPath(serverId, root);
+	if (!fs.existsSync(sock)) return null;
+	const conn = await tryConnect(sock);
+	if (!conn) return null;
+	return new Promise((resolve) => {
+		let buffer = "";
+		conn.on("data", (chunk) => { buffer += chunk.toString("utf8"); });
+		conn.on("end", () => {
+			try { resolve(JSON.parse(buffer.trim())); } catch { resolve(null); }
+		});
+		conn.on("error", () => resolve(null));
+		conn.write(JSON.stringify(payload) + "\n");
+	});
+}
+
+function sleep(ms) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ---------------------------------------------------------------- 输出格式化
+
+/** LSP 内部一律 0-based，对外一律 1-based —— 和 pi 的 read 工具输出对齐。 */
+function humanPos(position) {
+	return { line: (position?.line ?? 0) + 1, col: (position?.character ?? 0) + 1 };
+}
+
+function relPath(uri) {
+	let file = uri;
+	if (uri.startsWith("file://")) {
+		try { file = fileURLToPath(uri); } catch {}
+	}
+	const rel = path.relative(process.cwd(), file);
+	return rel && !rel.startsWith("..") ? rel : file;
+}
+
+const sourceCache = new Map();
+
+/** 取某一行源码做上下文。取不到就算了，不该因为读不到文件而让整条查询失败。 */
+function sourceLine(uri, line0) {
+	let file;
+	try {
+		file = uri.startsWith("file://") ? fileURLToPath(uri) : uri;
+	} catch {
+		return null;
+	}
+	if (!sourceCache.has(file)) {
+		try {
+			sourceCache.set(file, fs.readFileSync(file, "utf8").split("\n"));
+		} catch {
+			sourceCache.set(file, null);
+		}
+	}
+	const lines = sourceCache.get(file);
+	return lines?.[line0]?.trim() ?? null;
+}
+
+function formatLocations(locations, label) {
+	if (locations.length === 0) return `未找到${label}。`;
+	const lines = [`${locations.length} 处${label}：`];
+	for (const loc of locations) {
+		const { line, col } = humanPos(loc.range?.start);
+		const context = sourceLine(loc.uri, (loc.range?.start?.line ?? 0));
+		lines.push(`  ${relPath(loc.uri)}:${line}:${col}${context ? `  ${context}` : ""}`);
+	}
+	return lines.join("\n");
+}
+
+const SEVERITY = { 1: "error", 2: "warning", 3: "info", 4: "hint" };
+
+function formatDiagnostics(result, options) {
+	const items = (result.diagnostics ?? []).filter((d) => (d.severity ?? 1) <= (options.minSeverity ?? 2));
+	const file = relPath(result.uri);
+	if (items.length === 0) {
+		if (result.timedOut) return `${file}: 等诊断超时（服务器可能还在索引，用 lsp status 看状态）。`;
+		return `${file}: 无诊断。`;
+	}
+	const shown = items.slice(0, options.max ?? 50);
+	const lines = [`${file}: ${items.length} 条诊断`];
+	for (const item of shown) {
+		const { line, col } = humanPos(item.range?.start);
+		const severity = SEVERITY[item.severity ?? 1] ?? "error";
+		const code = item.code !== undefined ? ` [${item.code}]` : "";
+		const source = item.source ? ` (${item.source})` : "";
+		lines.push(`  ${file}:${line}:${col} ${severity}: ${item.message.replace(/\s+/g, " ")}${code}${source}`);
+	}
+	if (items.length > shown.length) lines.push(`  … 另有 ${items.length - shown.length} 条未显示`);
+	return lines.join("\n");
+}
+
+const SYMBOL_KIND = {
+	1: "file", 2: "module", 3: "namespace", 4: "package", 5: "class", 6: "method", 7: "property",
+	8: "field", 9: "constructor", 10: "enum", 11: "interface", 12: "function", 13: "variable",
+	14: "constant", 15: "string", 16: "number", 17: "boolean", 18: "array", 19: "object",
+	20: "key", 21: "null", 22: "enum-member", 23: "struct", 24: "event", 25: "operator", 26: "type-param",
+};
+
+function formatDocumentSymbols(symbols, uri, depth = 0) {
+	const lines = [];
+	for (const symbol of symbols) {
+		const range = symbol.selectionRange ?? symbol.range ?? symbol.location?.range;
+		const { line, col } = humanPos(range?.start);
+		const kind = SYMBOL_KIND[symbol.kind] ?? symbol.kind;
+		const detail = symbol.detail ? `  ${symbol.detail}` : "";
+		lines.push(`${"  ".repeat(depth + 1)}${kind} ${symbol.name}  ${relPath(symbol.location?.uri ?? uri)}:${line}:${col}${detail}`);
+		if (symbol.children?.length) lines.push(formatDocumentSymbols(symbol.children, uri, depth + 1));
+	}
+	return lines.join("\n");
+}
+
+function formatWorkspaceSymbols(symbols) {
+	if (symbols.length === 0) return "未找到匹配的符号。";
+	const lines = [`${symbols.length} 个符号：`];
+	for (const symbol of symbols) {
+		const loc = symbol.location ?? {};
+		const { line, col } = humanPos(loc.range?.start);
+		const kind = SYMBOL_KIND[symbol.kind] ?? symbol.kind;
+		const container = symbol.containerName ? `${symbol.containerName}.` : "";
+		lines.push(`  ${kind} ${container}${symbol.name}  ${relPath(loc.uri ?? "")}:${line}:${col}`);
+	}
+	return lines.join("\n");
+}
+
+function formatHover(hover) {
+	if (!hover?.contents) return "该位置没有 hover 信息。";
+	const contents = hover.contents;
+	const parts = Array.isArray(contents) ? contents : [contents];
+	return parts
+		.map((part) => (typeof part === "string" ? part : part.value ?? ""))
+		.filter(Boolean)
+		.join("\n\n")
+		.trim() || "该位置没有 hover 信息。";
+}
+
+function formatCalls(result, label) {
+	const item = result.item ?? {};
+	const head = `${item.name ?? "?"} 的${label}：`;
+	if (!result.calls || result.calls.length === 0) return `${head}\n  未找到。`;
+	const lines = [head];
+	for (const call of result.calls) {
+		const target = call.target ?? {};
+		const range = target.selectionRange ?? target.range;
+		const { line, col } = humanPos(range?.start);
+		lines.push(`  ${target.name ?? "?"}  ${relPath(target.uri ?? "")}:${line}:${col}`);
+	}
+	return lines.join("\n");
+}
+
+// ---------------------------------------------------------------- 安装
+
+/** 锁死版本：语言服务器的行为变化会直接改变诊断结果，升级要显式触发。 */
+const PINNED_NPM = {
+	"typescript-language-server": "6.0.0",
+	"@vue/language-server": "3.3.11",
+	pyright: "1.1.413",
+	"yaml-language-server": "1.24.0",
+	// vue 的 volar 需要一份 tsdk；typescript 7 是原生重写版，这里跟着 vue 的预期留在 5.x。
+	typescript: "5.9.3",
+};
+const DEFAULT_JDTLS_VERSION = "1.60.0";
+const NPM_SERVER_IDS = { typescript: true, vue: true, python: true, yaml: true };
+/** vue 不是独立服务器（并入 typescript），但仍作为合法的安装目标名。 */
+const INSTALL_ONLY_IDS = new Set(["vue"]);
+
+function run(command, args, options = {}) {
+	return new Promise((resolve, reject) => {
+		const child = spawn(command, args, { stdio: "inherit", ...options });
+		child.on("error", reject);
+		child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`${command} 退出码 ${code}`))));
+	});
+}
+
+async function download(url, dest) {
+	process.stderr.write(`下载 ${url}\n`);
+	const response = await fetch(url, { redirect: "follow" });
+	if (!response.ok) throw new UserError(`下载失败 HTTP ${response.status}: ${url}`);
+	const buffer = Buffer.from(await response.arrayBuffer());
+	fs.writeFileSync(dest, buffer);
+	return dest;
+}
+
+async function installNpmServers() {
+	fs.mkdirSync(SERVERS_DIR, { recursive: true });
+	const manifest = {
+		name: "pi-lsp-servers",
+		private: true,
+		description: "pi 自己管理的语言服务器，版本锁死，升级用 lsp install --upgrade",
+		dependencies: PINNED_NPM,
+	};
+	fs.writeFileSync(path.join(SERVERS_DIR, "package.json"), JSON.stringify(manifest, null, 2) + "\n");
+	await run("npm", ["install", "--prefix", SERVERS_DIR, "--no-audit", "--no-fund", "--loglevel", "error"]);
+	process.stderr.write("npm 语言服务器安装完成\n");
+}
+
+async function installJdtls(version) {
+	const target = version ?? DEFAULT_JDTLS_VERSION;
+	const base = `https://download.eclipse.org/jdtls/milestones/${target}`;
+	const response = await fetch(`${base}/latest.txt`);
+	if (!response.ok) throw new UserError(`取不到 jdtls ${target} 的文件名 (HTTP ${response.status})`);
+	const filename = (await response.text()).trim();
+	fs.mkdirSync(JDTLS_DIR, { recursive: true });
+	const tarball = path.join(os.tmpdir(), filename);
+	await download(`${base}/${filename}`, tarball);
+	await run("tar", ["-xzf", tarball, "-C", JDTLS_DIR]);
+	fs.unlinkSync(tarball);
+	if (!findJdtlsLauncher()) throw new UserError(`解压后没找到 launcher jar，检查 ${JDTLS_DIR}`);
+	fs.writeFileSync(path.join(JDTLS_DIR, "VERSION"), `${target}\n${filename}\n`);
+	process.stderr.write(`jdtls ${target} 安装完成\n`);
+}
+
+async function installLua() {
+	const response = await fetch("https://api.github.com/repos/LuaLS/lua-language-server/releases/latest", {
+		headers: { "user-agent": "pi-lsp" },
+	});
+	if (!response.ok) throw new UserError(`取不到 lua-language-server 版本 (HTTP ${response.status})`);
+	const release = await response.json();
+	const asset = (release.assets ?? []).find((item) => /linux-x64\.tar\.gz$/.test(item.name));
+	if (!asset) throw new UserError("这个 release 里没有 linux-x64 资产");
+	fs.mkdirSync(LUA_DIR, { recursive: true });
+	const tarball = path.join(os.tmpdir(), asset.name);
+	await download(asset.browser_download_url, tarball);
+	await run("tar", ["-xzf", tarball, "-C", LUA_DIR]);
+	fs.unlinkSync(tarball);
+	process.stderr.write(`lua-language-server ${release.tag_name} 安装完成\n`);
+}
+
+async function installServers(ids, options) {
+	const wanted = ids.length > 0 ? ids : ["java", "typescript", "vue", "python", "yaml", "lua"];
+	const unknown = wanted.filter((id) => !BUILTIN_SERVERS[id] && !INSTALL_ONLY_IDS.has(id));
+	if (unknown.length > 0) throw new UserError(`未知的服务器 id: ${unknown.join(", ")}`);
+	if (wanted.some((id) => NPM_SERVER_IDS[id])) await installNpmServers();
+	if (wanted.includes("java")) await installJdtls(options.jdtlsVersion);
+	if (wanted.includes("lua")) await installLua();
+	if (wanted.includes("cpp")) process.stderr.write("cpp 用系统的 clangd，无需安装。\n");
+	if (wanted.includes("vue")) process.stderr.write(".vue 由 typescript 服务器 + @vue/typescript-plugin 处理，已随 npm 一并安装。\n");
+}
+
+// ---------------------------------------------------------------- 服务器状态
+
+/** 每项服务器实际解析到什么、能不能用 —— 当 doctor 使。 */
+function reportServers(asJson) {
+	const config = loadConfig(null);
+	const rows = [];
+	for (const [id, entry] of Object.entries(config.servers)) {
+		entry.__id = id;
+		let command = null;
+		let error = null;
+		try {
+			command = resolveCommand(entry, process.cwd());
+		} catch (err) {
+			error = err.message;
+		}
+		const program = command?.[0] ?? null;
+		let available = false;
+		if (program) {
+			available = program.includes("/") ? fs.existsSync(program) : findOnPath(program) !== null;
+		}
+		rows.push({
+			id,
+			disabled: Boolean(entry.disabled),
+			extensions: entry.extensions ?? [],
+			program,
+			available,
+			error,
+		});
+	}
+	if (asJson) return JSON.stringify(rows, null, 2);
+	const lines = [];
+	for (const row of rows) {
+		const state = row.disabled ? "已禁用" : row.available ? "可用" : "未安装";
+		lines.push(`${row.id.padEnd(11)} ${state.padEnd(7)} ${row.extensions.join(" ")}`);
+		lines.push(`            ${row.program ?? row.error ?? "（未解析到命令）"}`);
+	}
+	lines.push("");
+	lines.push("未安装的用 'lsp install <id>' 安装；覆盖配置写 " + CONFIG_FILE);
+	return lines.join("\n");
+}
+
+function findOnPath(program) {
+	for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+		const candidate = path.join(dir, program);
+		try {
+			fs.accessSync(candidate, fs.constants.X_OK);
+			return candidate;
+		} catch {}
+	}
+	return null;
+}
+
+/** 扫 socket 目录看有哪些 daemon 活着。不会顺带把服务器启动起来。 */
+async function reportStatus(asJson) {
+	let files = [];
+	try {
+		files = fs.readdirSync(SOCK_DIR).filter((name) => name.endsWith(".sock"));
+	} catch {}
+	const entries = [];
+	for (const name of files) {
+		const sock = path.join(SOCK_DIR, name);
+		const conn = await tryConnect(sock, 800);
+		if (!conn) {
+			entries.push({ socket: name, alive: false });
+			continue;
+		}
+		const reply = await new Promise((resolve) => {
+			let buffer = "";
+			conn.on("data", (chunk) => { buffer += chunk.toString("utf8"); });
+			conn.on("end", () => {
+				try { resolve(JSON.parse(buffer.trim())); } catch { resolve(null); }
+			});
+			conn.on("error", () => resolve(null));
+			conn.write(JSON.stringify({ op: "status" }) + "\n");
+		});
+		entries.push(reply?.ok ? { ...reply.result, alive: true } : { socket: name, alive: false });
+	}
+	if (asJson) return JSON.stringify(entries, null, 2);
+	if (entries.length === 0) return "没有运行中的语言服务器。首次查询时会自动启动。";
+	const lines = ["运行中的语言服务器："];
+	for (const entry of entries) {
+		if (!entry.alive) {
+			lines.push(`  ${entry.socket}  （socket 残留，下次查询会自愈）`);
+			continue;
+		}
+		const minutes = Math.round(entry.uptimeMs / 60000);
+		lines.push(`  ${entry.serverId.padEnd(11)} ${entry.ready ? "就绪" : "启动中"}  已运行 ${minutes} 分钟  打开 ${entry.openDocs} 个文件`);
+		lines.push(`              ${entry.root}`);
+		if (entry.startError) lines.push(`              启动错误: ${entry.startError}`);
+		if (!entry.ready) lines.push(`              日志: ${entry.logFile}`);
+	}
+	return lines.join("\n");
+}
+
+async function stopServers(options) {
+	let files = [];
+	try {
+		files = fs.readdirSync(SOCK_DIR).filter((name) => name.endsWith(".sock"));
+	} catch {}
+	if (options.serverId) files = files.filter((name) => name.startsWith(`${options.serverId}-`));
+	if (files.length === 0) return "没有需要停止的服务器。";
+	const stopped = [];
+	for (const name of files) {
+		const sock = path.join(SOCK_DIR, name);
+		const conn = await tryConnect(sock, 800);
+		if (!conn) {
+			try { fs.unlinkSync(sock); } catch {}
+			continue;
+		}
+		await new Promise((resolve) => {
+			conn.on("data", () => {});
+			conn.on("end", resolve);
+			conn.on("error", resolve);
+			conn.write(JSON.stringify({ op: "shutdown" }) + "\n");
+		});
+		stopped.push(name);
+	}
+	return `已停止 ${stopped.length} 个服务器。`;
+}
+
+// ---------------------------------------------------------------- CLI
+
+const USAGE = `用法:
+  lsp diag <文件...>                    诊断（类型/编译错误）
+  lsp def     <文件> <位置>             跳定义
+  lsp refs    <文件> <位置>             找引用
+  lsp impl    <文件> <位置>             找实现
+  lsp hover   <文件> <位置>             类型签名与文档
+  lsp callers <文件> <位置>             谁调用了它
+  lsp callees <文件> <位置>             它调用了谁
+  lsp symbols <文件>                    文件符号大纲
+  lsp search  <关键词...>               全工程符号搜索（可加 --file 指明用哪个服务器）
+  lsp status                            运行中的语言服务器
+  lsp servers                           已注册的服务器及安装状态
+  lsp stop [--server <id>]              停掉常驻服务器
+  lsp install [<id>...]                 安装语言服务器
+
+位置（二选一）:
+  --symbol <名字>    按符号名定位，推荐 —— 不用自己数行列
+  --line <N> --col <N>   行列，均为 1-based（和 read 工具一致）
+
+选项:
+  --server <id>      指定语言服务器，不靠扩展名推断
+  --file <路径>      search 用它挑服务器和工作区
+  --min-severity <error|warning|info|hint>   诊断最低级别，默认 warning
+  --max <N>          诊断最多显示几条，默认 50
+  --timeout <毫秒>   单次请求超时，默认 ${DEFAULT_REQUEST_TIMEOUT_MS}
+  --json             输出原始 LSP 响应
+  -h, --help         显示本帮助
+
+首次对 Java 项目查询时 jdtls 要导入工程，可能几十秒到几分钟；用 'lsp status' 看进度。`;
+
+const BOOLEAN_FLAGS = new Set(["json", "help", "all", "upgrade"]);
+const SEVERITY_LEVEL = { error: 1, warning: 2, info: 3, hint: 4 };
+
+function camel(name) {
+	return name.replace(/-([a-z])/g, (_, ch) => ch.toUpperCase());
+}
+
+function parseArgs(argv) {
+	const positional = [];
+	const options = {};
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i];
+		if (arg === "-h") {
+			options.help = true;
+			continue;
+		}
+		if (!arg.startsWith("--")) {
+			positional.push(arg);
+			continue;
+		}
+		const eq = arg.indexOf("=");
+		const name = eq > 0 ? arg.slice(2, eq) : arg.slice(2);
+		const key = camel(name);
+		if (BOOLEAN_FLAGS.has(key)) {
+			options[key] = true;
+			continue;
+		}
+		options[key] = eq > 0 ? arg.slice(eq + 1) : argv[++i];
+	}
+	return { positional, options };
+}
+
+/** 把 1-based 的命令行位置转成 LSP 的 0-based。 */
+function positionPayload(options) {
+	const payload = {};
+	if (options.symbol) payload.symbol = options.symbol;
+	if (options.line !== undefined) {
+		const line = Number(options.line);
+		if (!Number.isFinite(line) || line < 1) throw new UserError("--line 必须是 >= 1 的整数");
+		payload.line = line - 1;
+	}
+	if (options.col !== undefined) {
+		const col = Number(options.col);
+		if (!Number.isFinite(col) || col < 1) throw new UserError("--col 必须是 >= 1 的整数");
+		payload.col = col - 1;
+	}
+	if (payload.symbol === undefined && payload.line === undefined) {
+		throw new UserError("需要 --symbol <名字>，或者 --line <N> --col <N>。");
+	}
+	return payload;
+}
+
+async function runQuery(op, file, extra, options) {
+	const target = resolveServer(file, options.server);
+	const payload = {
+		op,
+		file: path.resolve(file),
+		timeoutMs: options.timeout ? Number(options.timeout) : undefined,
+		...extra,
+	};
+	const reply = await daemonRequest(target.id, target.root, payload);
+	if (!reply.ok) throw new UserError(reply.error);
+	return reply.result;
+}
+
+async function main() {
+	const argv = process.argv.slice(2);
+	if (argv[0] === "__daemon") {
+		await runDaemon(argv[1], argv[2]);
+		return;
+	}
+	const [command, ...rest] = argv;
+	const { positional, options } = parseArgs(rest);
+	if (!command || options.help || command === "--help") {
+		process.stdout.write(USAGE + "\n");
+		return;
+	}
+
+	switch (command) {
+		case "diag": {
+			if (positional.length === 0) throw new UserError("要给至少一个文件。");
+			const minSeverity = SEVERITY_LEVEL[options.minSeverity ?? "warning"];
+			if (!minSeverity) throw new UserError("--min-severity 只能是 error|warning|info|hint");
+			const results = [];
+			for (const file of positional) {
+				const result = await runQuery("diag", file, {}, options);
+				results.push(result);
+			}
+			if (options.json) {
+				process.stdout.write(JSON.stringify(results, null, 2) + "\n");
+				return;
+			}
+			const max = options.max ? Number(options.max) : 50;
+			process.stdout.write(results.map((r) => formatDiagnostics(r, { minSeverity, max })).join("\n") + "\n");
+			return;
+		}
+		case "def":
+		case "refs":
+		case "impl": {
+			const file = positional[0];
+			if (!file) throw new UserError("要给文件路径。");
+			const result = await runQuery(command, file, positionPayload(options), options);
+			if (options.json) {
+				process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+				return;
+			}
+			const label = command === "def" ? "定义" : command === "refs" ? "引用" : "实现";
+			process.stdout.write(formatLocations(result.locations, label) + "\n");
+			return;
+		}
+		case "hover": {
+			const file = positional[0];
+			if (!file) throw new UserError("要给文件路径。");
+			const result = await runQuery("hover", file, positionPayload(options), options);
+			process.stdout.write((options.json ? JSON.stringify(result, null, 2) : formatHover(result.hover)) + "\n");
+			return;
+		}
+		case "callers":
+		case "callees": {
+			const file = positional[0];
+			if (!file) throw new UserError("要给文件路径。");
+			const result = await runQuery(command, file, positionPayload(options), options);
+			if (options.json) {
+				process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+				return;
+			}
+			process.stdout.write(formatCalls(result, command === "callers" ? "调用方" : "被调用方") + "\n");
+			return;
+		}
+		case "symbols": {
+			const file = positional[0];
+			if (!file) throw new UserError("要给文件路径。");
+			const result = await runQuery("symbols", file, {}, options);
+			if (options.json) {
+				process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+				return;
+			}
+			const text = formatDocumentSymbols(result.symbols, result.uri);
+			process.stdout.write((text || "这个文件里没有符号。") + "\n");
+			return;
+		}
+		case "search": {
+			const query = positional.join(" ").trim();
+			if (!query) throw new UserError("要给搜索关键词。");
+			const anchor = options.file ?? findAnchorFile(options.server);
+			if (!anchor) throw new UserError("search 需要 --file <该语言的任一文件> 或 --server <id> 来确定工作区。");
+			const result = await runQuery("search", anchor, { query }, options);
+			if (options.json) {
+				process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+				return;
+			}
+			process.stdout.write(formatWorkspaceSymbols(result.symbols) + "\n");
+			return;
+		}
+		case "status":
+			process.stdout.write((await reportStatus(options.json)) + "\n");
+			return;
+		case "servers":
+			process.stdout.write(reportServers(options.json) + "\n");
+			return;
+		case "stop":
+			process.stdout.write((await stopServers({ serverId: options.server })) + "\n");
+			return;
+		case "install":
+			await installServers(positional, { jdtlsVersion: options.jdtlsVersion });
+			return;
+		default:
+			throw new UserError(`未知子命令: ${command}\n\n${USAGE}`);
+	}
+}
+
+/** search 没给 --file 时，在 cwd 下找一个该服务器认得的文件当锚点。 */
+function findAnchorFile(serverId) {
+	if (!serverId) return null;
+	const entry = BUILTIN_SERVERS[serverId];
+	if (!entry) return null;
+	const stack = [process.cwd()];
+	let budget = 2000;
+	while (stack.length > 0 && budget-- > 0) {
+		const dir = stack.pop();
+		let items;
+		try {
+			items = fs.readdirSync(dir, { withFileTypes: true });
+		} catch {
+			continue;
+		}
+		for (const item of items) {
+			if (item.name.startsWith(".") || item.name === "node_modules" || item.name === "target") continue;
+			const full = path.join(dir, item.name);
+			if (item.isDirectory()) stack.push(full);
+			else if (entry.extensions.includes(path.extname(item.name).toLowerCase())) return full;
+		}
+	}
+	return null;
+}
+
+// 直接执行时跑 CLI；被 require 时只导出内部件供测试使用。
+if (require.main === module) {
+	main().catch((error) => {
+		process.stderr.write(`${error instanceof UserError ? error.message : `lsp: ${error.stack ?? error.message}`}\n`);
+		process.exit(1);
+	});
+}
+
+module.exports = {
+	LspClient,
+	UserError,
+	OPERATIONS,
+	createMessageReader,
+	writeMessage,
+	deepMerge,
+	findSymbol,
+	toLocations,
+	findRoot,
+	humanPos,
+	formatDiagnostics,
+	formatLocations,
+	parseArgs,
+	positionPayload,
+};

@@ -1,0 +1,132 @@
+#!/usr/bin/env node
+/**
+ * Context7 文档查询 CLI，替代原来的 context7 MCP server。
+ * 参数刻意保持不含 shell 特殊字符，方便 permission-gate 在非交互模式下放行。
+ */
+
+const API_BASE = "https://context7.com/api/v1";
+const TIMEOUT_MS = 60_000;
+const DEFAULT_TOKENS = 5000;
+
+const USAGE = `用法:
+  c7 search <关键词...>            搜索候选库，返回可用的 libraryId
+  c7 docs <libraryId> [主题...]    拉取该库文档（libraryId 形如 /vuejs/vue-router）
+
+选项:
+  --tokens <N>   docs 返回的文档规模，默认 ${DEFAULT_TOKENS}
+  --json         输出原始 JSON（search）或不做任何处理的正文（docs）
+  -h, --help     显示本帮助
+
+环境变量:
+  CONTEXT7_API_KEY  可选。匿名调用有速率限制，配置后按 Bearer 发送。`;
+
+/** 从参数里摘出选项，剩下的按位置参数返回。 */
+function parseArgs(argv) {
+	const positional = [];
+	const options = { tokens: DEFAULT_TOKENS, json: false, help: false };
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i];
+		if (arg === "--json") options.json = true;
+		else if (arg === "-h" || arg === "--help") options.help = true;
+		else if (arg === "--tokens") {
+			const value = Number.parseInt(argv[++i] ?? "", 10);
+			if (!Number.isFinite(value) || value <= 0) fail(`--tokens 需要正整数`);
+			options.tokens = value;
+		} else if (arg.startsWith("--tokens=")) {
+			const value = Number.parseInt(arg.slice("--tokens=".length), 10);
+			if (!Number.isFinite(value) || value <= 0) fail(`--tokens 需要正整数`);
+			options.tokens = value;
+		} else if (arg.startsWith("-")) fail(`未知选项: ${arg}`);
+		else positional.push(arg);
+	}
+	return { positional, options };
+}
+
+function fail(message) {
+	process.stderr.write(`c7: ${message}\n`);
+	process.exit(1);
+}
+
+async function request(url) {
+	const headers = { Accept: "*/*" };
+	const apiKey = process.env.CONTEXT7_API_KEY;
+	if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+
+	let response;
+	try {
+		response = await fetch(url, { headers, signal: AbortSignal.timeout(TIMEOUT_MS) });
+	} catch (error) {
+		const reason = error?.name === "TimeoutError" ? `请求超时（${TIMEOUT_MS / 1000}s）` : String(error?.message ?? error);
+		fail(`请求失败: ${reason}`);
+	}
+	const body = await response.text();
+	if (!response.ok) {
+		const hint = response.status === 429 ? "（匿名调用被限流，可配置 CONTEXT7_API_KEY）" : "";
+		fail(`HTTP ${response.status}${hint}: ${body.slice(0, 300)}`);
+	}
+	return body;
+}
+
+/** 搜索结果只保留选库需要的字段，避免把原始 JSON 全塞进上下文。 */
+function formatSearch(body) {
+	let parsed;
+	try {
+		parsed = JSON.parse(body);
+	} catch {
+		fail(`搜索响应不是合法 JSON: ${body.slice(0, 200)}`);
+	}
+	const results = Array.isArray(parsed?.results) ? parsed.results : [];
+	if (results.length === 0) return "没有匹配的库，换个关键词再试。";
+
+	const lines = [];
+	for (const item of results.slice(0, 15)) {
+		const trust = item.trustScore ?? "-";
+		const bench = item.benchmarkScore == null ? "-" : Number(item.benchmarkScore).toFixed(0);
+		lines.push(`${item.id} | ${item.title ?? ""} | trust=${trust} bench=${bench} snippets=${item.totalSnippets ?? "-"}`);
+		const description = (item.description ?? "").replace(/\s+/g, " ").trim();
+		if (description) lines.push(`    ${description.slice(0, 160)}`);
+		const versions = Array.isArray(item.versions) ? item.versions.slice(0, 6) : [];
+		if (versions.length > 0) lines.push(`    versions: ${versions.join(", ")}`);
+	}
+	if (results.length > 15) lines.push(`(共 ${results.length} 条，仅显示前 15 条)`);
+	lines.push("", "选 trust/bench/snippets 较高且名字匹配的 id，再执行: c7 docs <id> <主题>");
+	return lines.join("\n");
+}
+
+async function main() {
+	const { positional, options } = parseArgs(process.argv.slice(2));
+	const [command, ...rest] = positional;
+
+	if (options.help || !command) {
+		process.stdout.write(`${USAGE}\n`);
+		process.exit(command ? 0 : 1);
+	}
+
+	if (command === "search") {
+		const query = rest.join(" ").trim();
+		if (!query) fail("search 需要关键词");
+		const body = await request(`${API_BASE}/search?query=${encodeURIComponent(query)}`);
+		process.stdout.write(`${options.json ? body : formatSearch(body)}\n`);
+		return;
+	}
+
+	if (command === "docs") {
+		const [libraryId, ...topicParts] = rest;
+		if (!libraryId) fail("docs 需要 libraryId，例如 /vuejs/vue-router（先用 c7 search 查）");
+		if (!libraryId.startsWith("/")) fail(`libraryId 需以 / 开头，收到: ${libraryId}`);
+		const params = new URLSearchParams({ type: "txt", tokens: String(options.tokens) });
+		const topic = topicParts.join(" ").trim();
+		if (topic) params.set("topic", topic);
+		const body = await request(`${API_BASE}${libraryId}?${params}`);
+		const text = body.trim();
+		if (!text || text === "No content available" || text.startsWith("No context data")) {
+			fail(`该库没有返回内容，确认 libraryId 是否正确: ${libraryId}`);
+		}
+		process.stdout.write(`${text}\n`);
+		return;
+	}
+
+	fail(`未知子命令: ${command}\n${USAGE}`);
+}
+
+main();
