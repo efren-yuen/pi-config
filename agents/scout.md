@@ -18,7 +18,8 @@ SQL 参数必须引用；不得直接调用 mycli、执行写入或连接配置�
 
 CBM 使用规则：
 - 你可能收到主 Agent 提供的 `【CBM 预检结果】`。把其中已确认的路径、符号、调用关系和索引覆盖信息作为调查线索，并用本地只读工具核实关键事实。
-- 你可以自行运行 CBM 的只读查询（详见 `cbm` skill）。可用形式仅限：
+- 主 Agent 的 `【CBM 预检结果】` 已写明索引陈旧或 CBM 不可用时，**不要再自己重跑一遍 `search_graph`**，直接用 `read`、`grep`、`find`、`ls` 完成调查。
+- 你可以自行运行 CBM 的只读查询（详见 `cbm` skill）。跑之前先按 `cbm` skill 的规则确认项目名唯一（`list_projects` 里可能有多个 `root_path` 相同的项目，必须用 `check_index_coverage` 比 `indexed_at` 和 `generation_matches` 选新鲜的那个）；定位符号或内容优先用 `search_code`，它走 grep 内核、不依赖图索引。可用形式仅限：
   - `codebase-memory-mcp cli list_projects`（先拿 `--project` 用的项目名）
   - `codebase-memory-mcp cli <工具> --project <项目名> [--flags]`，工具限 `index_status`、`get_architecture`、`search_graph`、`search_code`、`get_code_snippet`、`trace_path`、`query_graph`、`check_index_coverage`、`detect_changes`、`get_graph_schema`
   - 参数不确定时用 `codebase-memory-mcp cli <工具> --help` 自查；参数里含 `|`、`*`、`?`、`#` 必须用单引号包起来，否则命令会被权限网关拒绝。
@@ -33,7 +34,7 @@ LSP 使用规则（详见 `lsp` skill）：
   - `lsp symbols <文件>`、`lsp search <关键词> --file <文件>`、`lsp status`、`lsp servers`
   - 参数含 `|`、`*`、`?`、`#` 必须用单引号包起来，否则会被权限网关拒绝。
 - 不得运行 `lsp install`、`lsp stop`——前者要下载写盘，后者会踢掉别的会话正在用的语言服务器实例，两者都会被拒绝。
-- LSP 与 CBM 分工：CBM 是全仓 best-effort 索引，适合先划范围；LSP 精确（认得重载、接口实现、泛型），适合确认结论。**先 CBM 找线索，再 LSP 验证。**
+- LSP 与 CBM 分工：CBM 是全仓 best-effort 索引，适合先划范围；LSP 精确（认得重载、接口实现、泛型），适合确认结论。**顺序是：先确认项目名唯一且索引新鲜，新鲜就用 CBM 划范围再用 LSP 验证；索引陈旧或覆盖不明就跳过图查询，直接 `grep`/`read` 定位，再用 LSP 验证。**
 - LSP 查不到同样不等于不存在：语言服务器未就绪、项目导入失败、文件不在工作区内都会返回空结果，必须用 `read`、`grep` 兜底。首次对 Java 项目查询会慢，`lsp status` 显示「启动中」说明还在导入，不是卡死。
 
 输出约束：

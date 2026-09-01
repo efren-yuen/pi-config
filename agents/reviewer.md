@@ -29,7 +29,7 @@ Database CLI 验证规则：reviewer 可在必要时使用 `/home/efren/.pi/agen
 `/home/efren/.pi/agent/bin/lsp diag <改动文件>`；追查影响面可用 `... refs <文件> --symbol <名字>`、`... callers`、`... def`、`... impl`、`... hover`、`... symbols`、`... status`。
 `lsp install` 和 `lsp stop` 会被网关拒绝，不要尝试。LSP 诊断不能替代项目自身的构建、lint 和测试，只作为快速前置判断；语言服务器未就绪或项目导入失败时会返回空结果，不得据此断言「没有问题」。
 
-需要确认改动的影响面时，可用 CBM 的只读查询（详见 `cbm` skill）：`codebase-memory-mcp cli list_projects`、`codebase-memory-mcp cli detect_changes --project <项目名>`、`... trace_path`、`... search_graph`、`... get_code_snippet`。写类工具（`index_repository`、`delete_project`、`manage_adr`）会被网关拒绝；参数含 `|`、`*`、`?`、`#` 时必须用单引号包起来。
+需要确认改动的影响面时，可用 CBM 的只读查询（详见 `cbm` skill）：`codebase-memory-mcp cli list_projects`、`codebase-memory-mcp cli detect_changes --project <项目名>`、`... trace_path`、`... search_graph`、`... get_code_snippet`。这些查询依赖图索引，用之前先确认项目名唯一、且索引新鲜（`codebase-memory-mcp cli check_index_coverage --project <项目名> --paths '<路径>'`，看 `generation_matches`）——`index_status` 的 `ready` 不代表新鲜；索引陈旧时图查询会返回空，不得据此判定「没有影响」。写类工具（`index_repository`、`delete_project`、`manage_adr`）会被网关拒绝；参数含 `|`、`*`、`?`、`#` 时必须用单引号包起来。
 
 安全要求：不要读取或输出凭据、令牌、私钥、`auth.json`、`.env`、`.ssh` 或云凭据内容。发现敏感路径暴露、权限绕过或潜在外泄时，报告风险但不访问敏感内容。
 

@@ -7,9 +7,11 @@ import path from "node:path";
 import {
 	isToolCallEventType,
 	type ExtensionAPI,
+	type ExtensionContext,
 	type ToolCallEventResult,
 	type UserBashEventResult,
 } from "@earendil-works/pi-coding-agent";
+import { watchPendingPermission } from "./notify.ts";
 
 const SAFE_GIT_SUBCOMMANDS = new Set(["status", "diff", "log", "show", "branch", "ls-files", "rev-parse", "describe"]);
 const SAFE_VERSION_COMMANDS = new Set(["node", "npm", "pnpm", "yarn", "bun", "python", "python3", "pip", "pip3", "git", "pi", "docker"]);
@@ -479,6 +481,18 @@ async function assessCommand(command: string, hasUI: boolean, select: (title: st
 	return choice === "Allow once" ? undefined : "Denied by user.";
 }
 
+/** 弹确认框的同时挂一个待办通知：人 15 秒没作答就发桌面通知（判定见 notify.ts）。 */
+function askUser(ctx: ExtensionContext, command: string): (title: string, options: string[]) => Promise<string | undefined> {
+	return async (title, options) => {
+		const cancel = watchPendingPermission(command, ctx);
+		try {
+			return await ctx.ui.select(title, options);
+		} finally {
+			cancel();
+		}
+	};
+}
+
 function deniedBashResult(reason: string): UserBashEventResult {
 	return { result: { output: `Permission gate: ${reason}`, exitCode: 1, cancelled: false, truncated: false } };
 }
@@ -496,7 +510,7 @@ export default function permissionGate(pi: ExtensionAPI): void {
 		const command = normalizeCommand(event.input.command);
 		if (!command) return { block: true, reason: "Denied: empty or invalid bash command." };
 		event.input.command = command;
-		const reason = await assessCommand(command, ctx.hasUI, (title, options) => ctx.ui.select(title, options));
+		const reason = await assessCommand(command, ctx.hasUI, askUser(ctx, command));
 		return reason ? { block: true, reason, terminate: Boolean(blockedCommand(command)) } : undefined;
 	});
 
@@ -504,7 +518,7 @@ export default function permissionGate(pi: ExtensionAPI): void {
 		const command = normalizeCommand(event.command);
 		if (!command) return deniedBashResult("Empty or invalid bash command.");
 		event.command = command;
-		const reason = await assessCommand(command, ctx.hasUI, (title, options) => ctx.ui.select(title, options));
+		const reason = await assessCommand(command, ctx.hasUI, askUser(ctx, command));
 		return reason ? deniedBashResult(reason) : undefined;
 	});
 }

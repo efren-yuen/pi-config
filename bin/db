@@ -20,7 +20,8 @@ const USAGE = `用法:
   /home/efren/.pi/agent/bin/db mysql explain '<SELECT SQL>'
 
 选项:
-  -h, --help  显示本帮助
+  -h, --help       显示本帮助
+  --dsn <name>     使用 .myclirc 中 [alias_dsn] 配置的 DSN 名称
 
 说明:
   仅支持只读操作；连接认证使用 mycli 的既有机制，不要把密码放入命令行。`;
@@ -33,12 +34,24 @@ function parseArgs(argv) {
 	if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "-h")) return { help: true };
 	if (argv.length < 2) usageError("需要指定 mysql 引擎和命令");
 	if (argv[0] !== "mysql") usageError("只支持 mysql 引擎");
-	const [command, value] = argv.slice(1);
+	// 提取 --dsn 选项
+	let dsn = null;
+	const filtered = [];
+	for (let i = 1; i < argv.length; i++) {
+		if (argv[i] === "--dsn" && i + 1 < argv.length) {
+			dsn = argv[++i];
+			if (!/^[A-Za-z0-9_-]+$/.test(dsn)) usageError("--dsn 名称只能包含字母、数字、下划线和连字符");
+		} else {
+			filtered.push(argv[i]);
+		}
+	}
+	if (filtered.length < 1) usageError("需要指定命令");
+	const [command, value] = filtered;
 	if (!COMMANDS.has(command)) usageError(`未知命令: ${command ?? ""}`);
-	if (command === "tables" && argv.length !== 2) usageError("tables 不接受参数");
-	if (command === "schema" && (argv.length !== 3 || !validateTableName(value))) usageError("schema 需要一个简单表名");
-	if ((command === "query" || command === "explain") && (argv.length !== 3 || !value || value.startsWith("-"))) usageError(`${command} 需要一条 SQL`);
-	return { help: false, engine: "mysql", command, value };
+	if (command === "tables" && filtered.length !== 1) usageError("tables 不接受参数");
+	if (command === "schema" && (filtered.length !== 2 || !validateTableName(value))) usageError("schema 需要一个简单表名");
+	if ((command === "query" || command === "explain") && (filtered.length !== 2 || !value || value.startsWith("-"))) usageError(`${command} 需要一条 SQL`);
+	return { help: false, engine: "mysql", command, value, dsn };
 }
 
 function validateTableName(name) {
@@ -79,15 +92,18 @@ function buildSql(command, value) {
 	usageError(`未知命令: ${command ?? ""}`);
 }
 
-function buildMycliArgs(sql) {
-	return ["--noninteractive", "--execute", sql];
+function buildMycliArgs(sql, dsn) {
+	const args = ["--noninteractive"];
+	if (dsn) args.push("--dsn", dsn);
+	args.push("--execute", sql);
+	return args;
 }
 
-function runMycli(sql) {
+function runMycli(sql, dsn) {
 	return new Promise((resolve, reject) => {
 		if (typeof sql !== "string" || !sql) return reject(new Error("SQL 不能为空"));
 		if (!fs.existsSync(MYCLI_PATH)) return reject(new Error(`找不到 mycli: ${MYCLI_PATH}`));
-		const child = spawn(MYCLI_PATH, buildMycliArgs(sql), {
+		const child = spawn(MYCLI_PATH, buildMycliArgs(sql, dsn), {
 			shell: false,
 			stdio: ["ignore", "pipe", "pipe"],
 		});
@@ -131,7 +147,7 @@ async function main() {
 		const parsed = parseArgs(process.argv.slice(2));
 		if (parsed.help) return process.stdout.write(`${USAGE}\n`);
 		const sql = buildSql(parsed.command, parsed.value);
-		const result = await runMycli(sql);
+		const result = await runMycli(sql, parsed.dsn);
 		process.stdout.write(result.stdout);
 	} catch (error) {
 		process.stderr.write(`db: ${error.message}\n`);

@@ -8,7 +8,7 @@ import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ExtensionAPI, ToolResultEventResult } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ToolResultEventResult } from "@earendil-works/pi-coding-agent";
 
 const LSP_CLI = "/home/efren/.pi/agent/bin/lsp";
 const GLOBAL_CONFIG = path.join(os.homedir(), ".pi", "agent", "lsp", "servers.json");
@@ -19,6 +19,8 @@ const WATCHED_TOOLS = new Set(["edit", "write"]);
 /** 只报错误和警告：info/hint 噪音太大，不值得占上下文。 */
 const MAX_SEVERITY = 2;
 const SEVERITY_LABEL: Record<number, string> = { 1: "error", 2: "warning" };
+/** footer 底部状态行的 key，诊断计数挂在这上面。 */
+const LSP_STATUS_KEY = "lsp";
 
 interface Diagnostic {
 	range?: { start?: { line?: number; character?: number } };
@@ -92,6 +94,33 @@ function formatBlock(file: string, diagnostics: Diagnostic[]): string {
 }
 
 export default function lspDiagnostics(pi: ExtensionAPI): void {
+	/** 本会话编辑过的文件 -> 最近一次诊断的计数，footer 显示其合计。 */
+	const fileCounts = new Map<string, { errors: number; warnings: number }>();
+
+	/** 把 fileCounts 汇总写进 footer 第三行；全干净就清掉，别留个 0 占地方。 */
+	function renderStatus(ctx: ExtensionContext): void {
+		let errors = 0;
+		let warnings = 0;
+		for (const count of fileCounts.values()) {
+			errors += count.errors;
+			warnings += count.warnings;
+		}
+		if (errors === 0 && warnings === 0) {
+			ctx.ui.setStatus(LSP_STATUS_KEY, undefined);
+			return;
+		}
+		const parts: string[] = [];
+		if (errors > 0) parts.push(`✗${errors}`);
+		if (warnings > 0) parts.push(`⚠${warnings}`);
+		ctx.ui.setStatus(LSP_STATUS_KEY, `LSP ${parts.join(" ")}`);
+	}
+
+	// 换会话后旧计数无意义。
+	pi.on("session_start", async (_event, ctx) => {
+		fileCounts.clear();
+		ctx.ui.setStatus(LSP_STATUS_KEY, undefined);
+	});
+
 	pi.on("tool_result", async (event, ctx): Promise<ToolResultEventResult | undefined> => {
 		if (!WATCHED_TOOLS.has(event.toolName) || event.isError) return undefined;
 		if (!autoDiagnosticsEnabled(ctx.cwd)) return undefined;
@@ -110,6 +139,18 @@ export default function lspDiagnostics(pi: ExtensionAPI): void {
 		if (!results) return undefined;
 
 		const diagnostics = (results[0]?.diagnostics ?? []).filter((item) => (item.severity ?? 1) <= MAX_SEVERITY);
+
+		// 只有真正拿到结果才更新计数：上面的早退分支是"查不到"，不是"没问题"。
+		if (diagnostics.length === 0) {
+			fileCounts.delete(file);
+		} else {
+			fileCounts.set(file, {
+				errors: diagnostics.filter((item) => (item.severity ?? 1) === 1).length,
+				warnings: diagnostics.filter((item) => item.severity === 2).length,
+			});
+		}
+		renderStatus(ctx);
+
 		// 干净就什么都不加，别制造噪音。
 		if (diagnostics.length === 0) return undefined;
 
