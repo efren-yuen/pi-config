@@ -8,15 +8,13 @@
 
 const EXA_URL = "https://mcp.exa.ai/mcp";
 const PARALLEL_URL = "https://search.parallel.ai/mcp";
-const TAVILY_SEARCH_URL = "https://api.tavily.com/search";
-const TAVILY_EXTRACT_URL = "https://api.tavily.com/extract";
-const TAVILY_USAGE_URL = "https://api.tavily.com/usage";
 const JINA_PREFIX = "https://r.jina.ai/";
 
 const SEARCH_TIMEOUT_MS = 30_000;
 const DEFAULT_FETCH_TIMEOUT_MS = 30_000;
 const MAX_FETCH_TIMEOUT_MS = 120_000;
 const MAX_RESPONSE_SIZE = 5 * 1024 * 1024;
+const MAX_REDIRECTS = 5;
 const DEFAULT_SEARCH_CHARS = 10_000;
 const DEFAULT_FETCH_CHARS = 20_000;
 
@@ -27,13 +25,10 @@ const HONEST_UA = "pi-web/1.0";
 const USAGE = `用法:
   web search <关键词...>     搜索网页，默认 Exa（免 key），失败自动回退 Parallel
   web fetch <url>            抓取网页正文，默认转 Markdown
-  web usage                  查看 Tavily 额度
 
 search 选项:
-  --provider <exa|parallel|tavily>   指定搜索源，默认 exa
+  --provider <exa|parallel>          指定搜索源，默认 exa
   --num <N>                          结果条数，默认 8
-  --type <auto|fast|deep>            Exa 检索强度，默认 auto
-  --livecrawl <fallback|preferred>   Exa 实时抓取策略，默认 fallback
   --max-chars <N>                    截断长度，默认 ${DEFAULT_SEARCH_CHARS}
 
 fetch 选项:
@@ -41,15 +36,13 @@ fetch 选项:
   --timeout <秒>                     默认 30，上限 120
   --max-chars <N>                    截断长度，默认 ${DEFAULT_FETCH_CHARS}
   --jina                             改走 r.jina.ai（免费，适合 JS 站点）
-  --tavily                           改走 Tavily extract（耗 credits，正文质量稳）
 
 通用:
   --json                             输出原始响应
   -h, --help                         显示本帮助
 
 环境变量:
-  EXA_API_KEY / PARALLEL_API_KEY     可选，提高配额
-  TAVILY_API_KEY                     --provider tavily / --tavily / usage 需要`;
+  EXA_API_KEY / PARALLEL_API_KEY     可选，提高配额`;
 
 function fail(message) {
 	process.stderr.write(`web: ${message}\n`);
@@ -59,13 +52,12 @@ function fail(message) {
 function parseArgs(argv) {
 	const positional = [];
 	const options = { json: false, help: false };
-	const withValue = new Set(["--provider", "--num", "--type", "--livecrawl", "--max-chars", "--format", "--timeout"]);
+	const withValue = new Set(["--provider", "--num", "--max-chars", "--format", "--timeout"]);
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i];
 		if (arg === "--json") options.json = true;
 		else if (arg === "-h" || arg === "--help") options.help = true;
 		else if (arg === "--jina") options.jina = true;
-		else if (arg === "--tavily") options.tavily = true;
 		else if (withValue.has(arg)) {
 			const value = argv[++i];
 			if (value === undefined) fail(`${arg} 缺少值`);
@@ -101,6 +93,25 @@ function wrapExternal(source, body) {
 	].join("\n");
 }
 
+/** 把等价的 IP 写法还原成点分十进制，其余原样返回。 */
+function normalizeHost(host) {
+	// URL 解析器会把 ::ffff:127.0.0.1 压缩成 ::ffff:7f00:1，两种写法都要认。
+	const mappedDotted = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(host);
+	if (mappedDotted) return mappedDotted[1];
+	const mappedHex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(host);
+	if (mappedHex) {
+		const n = (Number.parseInt(mappedHex[1], 16) << 16) | Number.parseInt(mappedHex[2], 16);
+		return [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join(".");
+	}
+	if (/^\d+$/.test(host)) {
+		const n = Number(host);
+		if (n >= 0 && n <= 0xffffffff) return [n >>> 24, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join(".");
+	}
+	const octal = /^0\d+(?:\.0?\d+){3}$/.test(host) || /^(?:0\d+\.){3}0?\d+$/.test(host);
+	if (octal) return host.split(".").map((part) => Number.parseInt(part, 8)).join(".");
+	return host;
+}
+
 /** 只允许 http/https 且拒绝内网与云元数据地址，避免把本机服务或凭据端点抓进上下文。 */
 function assertPublicHttpUrl(raw) {
 	let url;
@@ -112,7 +123,9 @@ function assertPublicHttpUrl(raw) {
 	if (url.protocol !== "http:" && url.protocol !== "https:") {
 		fail(`只支持 http/https，收到: ${url.protocol}`);
 	}
-	const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+	// 数字型（http://2130706433/）和八进制（http://0177.0.0.1/）都会被解析器还原成 127.0.0.1，
+	// 纯字符串正则看不出来；IPv4-mapped IPv6 同理。先归一化再判断。
+	const host = normalizeHost(url.hostname.toLowerCase().replace(/^\[|\]$/g, ""));
 	const isPrivate =
 		host === "localhost" ||
 		host.endsWith(".localhost") ||
@@ -174,9 +187,9 @@ async function searchExa(query, options) {
 	const url = key ? `${EXA_URL}?exaApiKey=${encodeURIComponent(key)}` : EXA_URL;
 	const body = mcpRequest("web_search_exa", {
 		query,
-		type: options.type ?? "auto",
+		type: "auto",
 		numResults: positiveInt(options.num, 8, "--num"),
-		livecrawl: options.livecrawl ?? "fallback",
+		livecrawl: "fallback",
 		contextMaxCharacters: positiveInt(options["max-chars"], DEFAULT_SEARCH_CHARS, "--max-chars"),
 	});
 	return postJson(url, body, {}, SEARCH_TIMEOUT_MS);
@@ -189,40 +202,10 @@ async function searchParallel(query) {
 	return postJson(PARALLEL_URL, body, headers, SEARCH_TIMEOUT_MS);
 }
 
-async function searchTavily(query, options) {
-	const key = process.env.TAVILY_API_KEY;
-	if (!key) fail("--provider tavily 需要 TAVILY_API_KEY");
-	const body = {
-		query,
-		max_results: positiveInt(options.num, 8, "--num"),
-		search_depth: options.type === "deep" ? "advanced" : "basic",
-		include_answer: false,
-	};
-	return postJson(TAVILY_SEARCH_URL, body, { Authorization: `Bearer ${key}` }, SEARCH_TIMEOUT_MS);
-}
-
-function formatTavilySearch(raw) {
-	const data = JSON.parse(raw);
-	const results = Array.isArray(data.results) ? data.results : [];
-	if (results.length === 0) return "没有搜索结果。";
-	return results
-		.map((item, index) => {
-			const content = (item.content ?? "").replace(/\s+/g, " ").trim();
-			return `[${index + 1}] ${item.title ?? ""}\nURL: ${item.url}\n${content.slice(0, 600)}`;
-		})
-		.join("\n\n");
-}
-
 async function runSearch(query, options) {
 	const provider = options.provider ?? "exa";
-	if (!["exa", "parallel", "tavily"].includes(provider)) fail(`--provider 只支持 exa|parallel|tavily，收到: ${provider}`);
+	if (!["exa", "parallel"].includes(provider)) fail(`--provider 只支持 exa|parallel，收到: ${provider}`);
 	const limit = positiveInt(options["max-chars"], DEFAULT_SEARCH_CHARS, "--max-chars");
-
-	if (provider === "tavily") {
-		const raw = await searchTavily(query, options).catch((error) => fail(`Tavily 搜索失败: ${error.message}`));
-		if (options.json) return raw;
-		return wrapExternal("tavily 搜索结果", truncate(formatTavilySearch(raw), limit));
-	}
 
 	let raw;
 	let used = provider;
@@ -350,14 +333,24 @@ async function fetchDirect(url, format, timeoutMs) {
 		"Accept-Language": "en-US,en;q=0.9",
 	};
 
-	let response = await fetch(url, { headers, redirect: "follow", signal: AbortSignal.timeout(timeoutMs) });
-	// Cloudflare 会因 TLS 指纹与浏览器 UA 不符而拦截，这时反而是诚实 UA 更容易过。
-	if (response.status === 403 && response.headers.get("cf-mitigated") === "challenge") {
-		response = await fetch(url, {
-			headers: { ...headers, "User-Agent": HONEST_UA },
-			redirect: "follow",
-			signal: AbortSignal.timeout(timeoutMs),
-		});
+	// 手动跟随重定向：redirect:"follow" 只有第一跳过了 assertPublicHttpUrl，
+	// 一个公网 URL 302 到 169.254.169.254 就会被照抓不误。每一跳都要重新校验。
+	let current = url;
+	let response;
+	for (let hop = 0; ; hop++) {
+		response = await fetch(current, { headers, redirect: "manual", signal: AbortSignal.timeout(timeoutMs) });
+		// Cloudflare 会因 TLS 指纹与浏览器 UA 不符而拦截，这时反而是诚实 UA 更容易过。
+		if (response.status === 403 && response.headers.get("cf-mitigated") === "challenge") {
+			response = await fetch(current, {
+				headers: { ...headers, "User-Agent": HONEST_UA },
+				redirect: "manual",
+				signal: AbortSignal.timeout(timeoutMs),
+			});
+		}
+		const location = response.status >= 300 && response.status < 400 ? response.headers.get("location") : null;
+		if (!location) break;
+		if (hop >= MAX_REDIRECTS) throw new Error(`重定向超过 ${MAX_REDIRECTS} 跳`);
+		current = assertPublicHttpUrl(new URL(location, current).href).href;
 	}
 	if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
 
@@ -384,27 +377,10 @@ async function fetchViaJina(url, timeoutMs) {
 	return text;
 }
 
-async function fetchViaTavily(url, timeoutMs) {
-	const key = process.env.TAVILY_API_KEY;
-	if (!key) fail("--tavily 需要 TAVILY_API_KEY");
-	const raw = await postJson(
-		TAVILY_EXTRACT_URL,
-		{ urls: [url], format: "markdown" },
-		{ Authorization: `Bearer ${key}` },
-		timeoutMs,
-	);
-	const data = JSON.parse(raw);
-	const first = (data.results ?? [])[0];
-	if (!first) throw new Error(`Tavily 未能提取内容: ${JSON.stringify(data.failed_results ?? []).slice(0, 200)}`);
-	return first.raw_content ?? "";
-}
-
 async function runFetch(rawUrl, options) {
 	const url = assertPublicHttpUrl(rawUrl);
 	const format = options.format ?? "markdown";
 	if (!["markdown", "text", "html"].includes(format)) fail(`--format 只支持 markdown|text|html，收到: ${format}`);
-	if (options.jina && options.tavily) fail("--jina 与 --tavily 不能同时用");
-
 	const timeoutMs = Math.min(positiveInt(options.timeout, DEFAULT_FETCH_TIMEOUT_MS / 1000, "--timeout") * 1000, MAX_FETCH_TIMEOUT_MS);
 	const limit = positiveInt(options["max-chars"], DEFAULT_FETCH_CHARS, "--max-chars");
 
@@ -412,13 +388,8 @@ async function runFetch(rawUrl, options) {
 		const text = await fetchViaJina(url.href, timeoutMs).catch((error) => fail(`Jina 抓取失败: ${error.message}`));
 		return options.json ? text : wrapExternal(`${url.href} via r.jina.ai`, truncate(text, limit));
 	}
-	if (options.tavily) {
-		const text = await fetchViaTavily(url.href, timeoutMs).catch((error) => fail(`Tavily 抓取失败: ${error.message}`));
-		return options.json ? text : wrapExternal(`${url.href} via tavily`, truncate(text, limit));
-	}
-
 	const { body, contentType } = await fetchDirect(url.href, format, timeoutMs).catch((error) =>
-		fail(`抓取失败: ${error.message}（复杂或 JS 站点可加 --jina 或 --tavily）`),
+		fail(`抓取失败: ${error.message}（复杂或 JS 站点可加 --jina）`),
 	);
 	if (options.json) return body;
 
@@ -428,25 +399,6 @@ async function runFetch(rawUrl, options) {
 	else if (format === "text" && isHtml) output = htmlToText(body);
 
 	return wrapExternal(`${url.href} (${contentType || "unknown"})`, truncate(output.trim(), limit));
-}
-
-async function runUsage(options) {
-	const key = process.env.TAVILY_API_KEY;
-	if (!key) fail("usage 需要 TAVILY_API_KEY");
-	const response = await fetch(TAVILY_USAGE_URL, {
-		headers: { Authorization: `Bearer ${key}` },
-		signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
-	});
-	const raw = await response.text();
-	if (!response.ok) fail(`HTTP ${response.status}: ${raw.slice(0, 200)}`);
-	if (options.json) return raw;
-	const data = JSON.parse(raw);
-	const account = data.account ?? {};
-	return [
-		`plan: ${account.current_plan ?? "-"}`,
-		`used: ${account.plan_usage ?? "-"} / ${account.plan_limit ?? "-"}`,
-		`search: ${account.search_usage ?? 0}  extract: ${account.extract_usage ?? 0}  crawl: ${account.crawl_usage ?? 0}`,
-	].join("\n");
 }
 
 async function main() {
@@ -471,11 +423,6 @@ async function main() {
 		process.stdout.write(`${await runFetch(url, options)}\n`);
 		return;
 	}
-	if (command === "usage") {
-		process.stdout.write(`${await runUsage(options)}\n`);
-		return;
-	}
-
 	fail(`未知子命令: ${command}\n${USAGE}`);
 }
 
