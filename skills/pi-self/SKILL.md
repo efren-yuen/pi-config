@@ -7,15 +7,23 @@ description: 修改 pi 自身配置时使用（~/.pi/agent 下的 bin/、skills/
 
 `~/.pi/agent` 有几处隐性耦合，改错顺序会表现成「改了但没生效」。
 
-## 改 CLI 调用形式 → 三处必须同步
+## 改 CLI 调用形式 → 只改两处
 
-动了 `bin/c7`、`bin/web`、`bin/lsp` 的子命令或选项，以下三处都要跟着改：
+动了 `bin/c7`、`bin/web`、`bin/lsp`、`bin/db` 的子命令或选项，跟着改：
 
 1. `skills/<name>/SKILL.md` 的命令清单
-2. `agents/scout.md` 和 `agents/reviewer.md` 里的可用命令列表
-3. `extensions/permission-gate.ts` 的子命令与选项白名单
+2. `agents/scout.md`、`agents/reviewer.md` 里提到该命令的地方
 
-漏任何一处，subagent 调用时就会拿到 `Denied`。
+**不需要改权限网关**——它不再维护任何命令白名单。以前那套「三处同步」正是白名单制的代价，
+删掉白名单之后这条纪律也就没了。
+
+## lsp 只认全局配置
+
+`bin/lsp` 刻意不读项目里的 `.pi/lsp.json`：那一层能覆盖 `command` 和 `env`，
+而 `lsp-diagnostics` 扩展在每次 edit/write 之后自动跑 diag——等于 clone 一个仓库、
+改一个文件，仓库里写的命令就在本机跑起来了，全程无提示。配置只有内置 + `lsp/servers.json` 两层。
+
+自动诊断也没有开关，永远开着。不想要就把扩展删掉，不需要为它留一个配置项。
 
 ## 改完 bin/lsp 必须 `lsp stop`
 
@@ -43,14 +51,12 @@ python3 -c "import json; json.load(open('/home/efren/.pi/agent/settings.json'));
 
 ## registerTool 类扩展不过 permission-gate
 
-网关只挂在 `tool_call`（write/edit/read/grep/find/ls/bash/powershell）和 `user_bash` 上。
-扩展用 `pi.registerTool()` 注册的工具**完全不经过它**——`bin/web` 那套「交互放行、subagent 拒绝」
-的分流对自定义工具无效。
+网关只挂在 `tool_call`（read/write/edit/grep/find/ls/bash/powershell）和 `user_bash` 上。
+扩展用 `pi.registerTool()` 注册的工具**完全不经过它**。
 
 所以新增这类工具时，两件事必须自己做：
 
-1. 在 `execute` 里判 `ctx.hasUI`（print/json 模式为 `false`，subagent 走 `--mode json -p`），
-   需要限交互的能力自己返回错误。
+1. 要限交互就自己判 `ctx.hasUI`（print/json 模式为 `false`，subagent 走 `--mode json -p`）。
 2. 确认哪些 agent 会继承到它。`extensions/subagent/index.ts:307` 只有在 agent 声明了
    `tools:` 时才传 `--tools`（严格白名单，扩展工具一并挡掉）；**不声明 `tools:` 的 agent
    会拿到全部内置工具 + 全部扩展工具**，包括 `subagent` 自己（可递归）。四个 agent 现在都声明了。
@@ -72,6 +78,17 @@ diff -u /usr/lib/node_modules/pi/packages/coding-agent/examples/extensions/subag
 ```
 
 只看到那两个 hunk 就是没漂；多出别的说明上游改了，需要手工合。
+
+## 权限网关是黑名单，不要往回改成白名单
+
+`extensions/permission-gate.ts` 只拦四类事：删系统目录 / 格式化磁盘 / fork bomb、
+git force push、命令文本引用受保护路径、把凭据或环境变量喂给 curl。
+加上工具侧对 `read/write/edit/grep/find/ls` 的受保护路径检查。**其余一律放行，不弹确认框。**
+
+它曾经是白名单制（20 个 SAFE_* 集合 + 手写 shell 分词器，544 行），
+代价是每接一个 CLI 都要改三个地方，漏一处就是莫名其妙的 `Denied`。
+真正的边界是最小权限账号、备份和人工审查，不是这个文件。想加限制之前先问：
+这条规则挡住的损失，值不值得它带来的维护成本。
 
 ## 新能力写 skill + CLI，不装 MCP server
 

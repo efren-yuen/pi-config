@@ -9,7 +9,8 @@ tools: read, grep, find, ls, bash
 
 bash 使用限制：只允许运行只读校验命令，例如 lint、类型检查、构建、测试和只读 git 查询。不得执行安装、迁移、格式化写回、提交、推送或任何修改工作区的命令。命令被权限网关拒绝时，如实记录被拒命令并在“验证评估”中说明该项验证未覆盖，不要尝试绕过。
 
-Database CLI 验证规则：reviewer 可在必要时使用 `/home/efren/.pi/agent/bin/db mysql tables|schema|query|explain` 四种只读形式；默认优先运行离线 `db.test.js`、help 和拒绝路径测试。不得直接运行 mycli、读取 native 配置或在报告粘贴数据库结果。若 permission gate 放行任意 mycli 参数、SQL 写入语句或凭据参数，列为阻塞问题；同时检查改动严格限于任务允许清单。
+工具用法见对应 skill：`lsp`、`cbm`、`database`、`git`。参数不确定跑 `--help`。
+不要在报告里粘贴数据库查询结果或任何凭据内容。
 
 审查顺序（按此顺序推进，不要从头理解整个项目）：
 1. 先用 git 取得本次全部改动：`git diff`（工作区）和 `git diff --cached`（已暂存）。
@@ -18,18 +19,16 @@ Database CLI 验证规则：reviewer 可在必要时使用 `/home/efren/.pi/agen
 4. 检查相关测试是否覆盖本次改动。
 5. 运行类型检查、lint、构建、测试。
 
-可用的 git 命令（非交互模式下只有这些形式会被放行）：
-`git diff`、`git diff --cached`、`git diff --stat`、`git diff --name-only`、`git status --short`、`git log --oneline`、`git branch --show-current`。
-
-不要使用 `git diff HEAD`、`git diff HEAD~1`、`git diff main...HEAD`、`git diff -- <路径>`、`git log --oneline -10`、`git show HEAD`——带 revision 或路径参数会被权限网关直接拒绝。需要限定范围时，先用 `git diff --name-only` 拿文件清单，再用 read 逐个查看。
-
 若当前目录不是 git 仓库，`git diff` 会失败；改为依据任务中给出的改动文件清单，用 read/grep 审查。
 
-验证改动有没有引入类型或编译错误时，优先用 LSP（详见 `lsp` skill），它比跑完整构建快得多：
-`/home/efren/.pi/agent/bin/lsp diag <改动文件>`；追查影响面可用 `... refs <文件> --symbol <名字>`、`... callers`、`... def`、`... impl`、`... hover`、`... symbols`、`... status`。
-`lsp install` 和 `lsp stop` 会被网关拒绝，不要尝试。LSP 诊断不能替代项目自身的构建、lint 和测试，只作为快速前置判断；语言服务器未就绪或项目导入失败时会返回空结果，不得据此断言「没有问题」。
+验证改动有没有引入类型或编译错误时，优先用 LSP（详见 `lsp` skill），比跑完整构建快得多：
+`/home/efren/.pi/agent/bin/lsp diag <改动文件>`；追影响面用 `refs`、`callers`、`def`、`impl`。
+LSP 诊断不能替代项目自身的构建、lint 和测试；语言服务器未就绪或项目导入失败时会返回空结果，
+不得据此断言「没有问题」。
 
-需要确认改动的影响面时，可用 CBM 的只读查询（详见 `cbm` skill）：`codebase-memory-mcp cli list_projects`、`codebase-memory-mcp cli detect_changes --project <项目名>`、`... trace_path`、`... search_graph`、`... get_code_snippet`。这些查询依赖图索引，用之前先确认项目名唯一、且索引新鲜（`codebase-memory-mcp cli check_index_coverage --project <项目名> --paths '<路径>'`，看 `generation_matches`）——`index_status` 的 `ready` 不代表新鲜；索引陈旧时图查询会返回空，不得据此判定「没有影响」。写类工具（`index_repository`、`delete_project`、`manage_adr`）会被网关拒绝；参数含 `|`、`*`、`?`、`#` 时必须用单引号包起来。
+需要确认改动的影响面时可用 CBM 的只读查询（详见 `cbm` skill）。图查询依赖索引新鲜度——
+用之前先确认项目名唯一且 `check_index_coverage` 的 `generation_matches` 为真；
+索引陈旧时图查询会返回空，**不得据此判定「没有影响」**，要用 `grep`/`read` 兜底。
 
 安全要求：不要读取或输出凭据、令牌、私钥、`auth.json`、`.env`、`.ssh` 或云凭据内容。发现敏感路径暴露、权限绕过或潜在外泄时，报告风险但不访问敏感内容。
 

@@ -38,9 +38,11 @@ codebase-memory-mcp cli get_code_snippet --project <项目名> --qualified-name 
 | `detect_changes` | 变更影响面（可比 base branch） |
 | `get_graph_schema` | 图的 label / 关系类型 |
 
-## 写类工具（仅交互模式，需用户确认）
+## 写类工具
 
-`index_repository`、`delete_project`、`manage_adr`、`ingest_traces` 会改索引或落盘，非交互模式（subagent）下会被权限网关拒绝。需要索引新项目时，交给用户或在交互模式下明确征得同意，不要自作主张跑。
+`index_repository`、`delete_project`、`manage_adr`、`ingest_traces` 会改索引或落盘。
+网关不拦它们，但**不要自作主张跑**——索引一个大仓库要几分钟，删项目不可逆。
+需要索引新项目时先问用户。
 
 ## 纪律
 
@@ -69,14 +71,3 @@ codebase-memory-mcp cli get_code_snippet --project <项目名> --qualified-name 
 交接给 scout 的 `【CBM 预检结果】` 必须包含：所选项目名与理由、索引时间与体检结论、实际执行过的查询、
 已确认的路径/符号（没有就写"无"）、覆盖缺口。CBM 不可用或索引陈旧时明确写
 "索引陈旧/CBM 不可用，未获得可信线索，全部走文件工具"。不得编造未执行的查询。
-
-## 非交互模式下的命令写法
-
-subagent 的权限网关按引号解析命令：参数里出现 `|`、`*`、`?`、`#`、`!` 时必须**用单引号包起来**，否则整条命令被拒。
-
-```bash
-codebase-memory-mcp cli search_code --project ai --pattern 'foo|bar' --regex true
-codebase-memory-mcp cli search_graph --project ai --file-pattern '*.java'
-```
-
-`$`、反引号、`;`、`|` 作为 shell 语法（引号外）一律被拒——不要拼管道、重定向或命令替换，需要过滤就用工具自己的 `--limit` / `--path-filter`。

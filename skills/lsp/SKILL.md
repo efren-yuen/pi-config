@@ -47,17 +47,21 @@ Java、C/C++ 的方法名在符号表里带签名（`countOrders()`、`addOrder(
 | Lua | lua-language-server | |
 | C / C++ | clangd（系统自带） | 需要 `compile_commands.json` 才准 |
 
-没装的用 `lsp install <id>`（**只能交互模式跑**，会下载并写盘）。
+没装的用 `lsp install <id>`（会下载并写盘，建议交互模式下跑）。
 
 ## Java 多版本
 
 jdtls 进程固定跑在 JDK 21 上，但**项目用哪个 JDK 编译是另一回事**：本机 8/11/17/21 四套运行时都已声明给 jdtls，它读 pom 的 `maven.compiler.source` 或 gradle 的 `sourceCompatibility` 自动选。Java 8 老项目会正确地把 `var` 报成错误。
 
-**Gradle 老项目的坑**：Gradle < 7.3 跑不在 JDK 21 上，导入会失败。在项目里建 `.pi/lsp.json`：
+**Gradle 老项目的坑**：Gradle < 7.3 跑不在 JDK 21 上，导入会失败。
+在全局 `~/.pi/agent/lsp/servers.json` 里给 java 补 settings：
 
 ```json
 { "servers": { "java": { "settings": { "java": { "import": { "gradle": { "java": { "home": "/usr/lib/jvm/java-11-openjdk" } } } } } } } }
 ```
+
+**项目里的 `.pi/lsp.json` 不再被读取**：那一层能覆盖 `command` 和 `env`，
+而编辑后自动诊断是无提示触发的，等于 clone 一个仓库就能在本机执行任意命令。配置只认全局这一份。
 
 ## 纪律
 
@@ -65,8 +69,7 @@ jdtls 进程固定跑在 JDK 21 上，但**项目用哪个 JDK 编译是另一�
 - **LSP 和 CBM 分工不同**：CBM 是全仓 best-effort 索引，跨语言、不需要项目能构建，适合先划范围；LSP 精确（认得重载、接口实现、泛型），但只覆盖装了服务器的语言且依赖项目能被正确导入。**先用 CBM 找线索，要确定结论时用 LSP 验证。**
 - **LSP 查不到不等于不存在**：语言服务器没就绪、项目导入失败、文件不在工作区内，都会返回空结果。拿不准就用 `read`/`grep` 兜底，不要据此断言代码不存在。
 - **诊断不能替代构建和测试**。它反映的是语言服务器的视角，最终仍以项目自己的构建、lint 和测试为准。
-- 参数里含 `|`、`*`、`?`、`#` 必须用单引号包起来，否则命令会被权限网关拒绝。
-- `lsp install` 和 `lsp stop` 在非交互模式（subagent）会被拒绝。`stop` 会踢掉别的会话正在用的热实例，需要时由主 Agent 执行。
+- `lsp stop` 会踢掉别的会话正在用的热实例，`install` 要下载写盘——网关不拦，但都该由主 Agent 在交互模式下执行。
 
 ## 编辑后会自动诊断
 

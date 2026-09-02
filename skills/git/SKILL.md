@@ -5,7 +5,7 @@ description: 提交代码、查看改动、写 commit message 时使用。包含
 
 # Git
 
-权限网关（`extensions/permission-gate.ts`）对 git 有三条从命令行看不出来的行为，先看这三条。
+权限网关（`extensions/permission-gate.ts`）对 git 有两条从命令行看不出来的行为。
 
 ## 1. commit message 不能带真实换行
 
@@ -17,29 +17,12 @@ description: 提交代码、查看改动、写 commit message 时使用。包含
 git commit -m "Add retry to sync job" -m "Why: upstream 502s were dropping records." -m "Risk: none, retry is capped at 3."
 ```
 
-## 2. 写操作只有主 Agent 能做
+## 2. 只有 force push 会被硬拒
 
-只读查询（status/diff/log/show/branch/ls-files/rev-parse，且选项在白名单内）任何场景都放行。
+`git push --force` / `-f` / `+branch` 直接拒绝，不给确认机会。
+其余 git 命令（含 `add`、`commit`、`checkout`、`merge`、`push`）主 Agent 和 subagent 都能跑。
 
-`add`、`commit`、`checkout`、`merge` 这些会落到网关末尾的交互分支：
-
-- 交互会话 —— 弹一次「Allow once」确认，同意后执行
-- subagent（非交互）—— 直接返回 `Denied: non-interactive mode only allows known read-only commands.`
-
-**不要让 worker 或 reviewer 去提交**，提交由主 Agent 做。
-
-## 3. 会被拒的具体形式
-
-硬拒（`terminate: true`，不弹确认）：
-
-- `git push --force`、`-f`、`+branch`
-
-超出只读选项白名单，一律拒：
-
-- `git diff HEAD`、`git diff HEAD~1`、`git diff main...HEAD`、`git diff -- <路径>`
-- `git log --oneline -10`、`git show HEAD`
-
-带 revision 或路径参数就会触发。要限定范围时，先 `git diff --name-only` 拿文件清单，再逐个 read。
+提交仍然建议由主 Agent 做——不是网关限制，是流程上不该让 worker 自己决定提交什么。
 
 ## 提交习惯
 
