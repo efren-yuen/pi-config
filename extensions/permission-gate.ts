@@ -54,6 +54,14 @@ function hasOnlySafeCheckOptions(args: string[]): boolean {
 	return args.every((arg) => !arg.startsWith("-") || SAFE_CHECK_OPTION.test(arg));
 }
 
+/**
+ * 内置只读工具同样要拦路径：read/grep/find/ls 不走 bash，
+ * blockedCommand() 里那套凭据路径正则对它们完全不生效，
+ * 没有这一段的话 `read ~/.pi/agent/auth.json` 会直接成功。
+ * 只判断被点名的路径本身，不递归判断搜索结果——那是 grep 输出过滤的问题，不在网关职责内。
+ */
+const READ_TOOLS = new Set(["read", "grep", "find", "ls"]);
+
 function isSensitiveName(name: string): boolean {
 	return (
 		name === "auth.json" ||
@@ -502,6 +510,18 @@ export default function permissionGate(pi: ExtensionAPI): void {
 		if (isToolCallEventType("write", event) || isToolCallEventType("edit", event)) {
 			if (await isProtectedWritePath(event.input.path, ctx.cwd)) {
 				return { block: true, reason: "Denied: cannot write or edit a protected path.", terminate: true };
+			}
+			return undefined;
+		}
+
+		if (READ_TOOLS.has(event.toolName)) {
+			const requested = (event.input as { path?: unknown }).path;
+			// grep/find/ls 的 path 可以省略，省略就是当前目录，不该因此被拦；
+			// read 的 path 必填，缺失时交给 isProtectedWritePath fail-closed。
+			const target =
+				typeof requested === "string" && requested.trim() ? requested : event.toolName === "read" ? requested : ".";
+			if (await isProtectedWritePath(target, ctx.cwd)) {
+				return { block: true, reason: "Denied: cannot read a protected path." };
 			}
 			return undefined;
 		}
