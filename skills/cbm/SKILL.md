@@ -51,6 +51,25 @@ codebase-memory-mcp cli get_code_snippet --project <项目名> --qualified-name 
 - CBM 是 best-effort 索引。看到 `parse_partial`、`skipped`、`not_indexed`、覆盖范围不明或空结果时，**必须**用 `read`/`grep`/`find`/`ls` 兜底核实，不得据此断言代码或文件不存在。
 - 报告结论时说明选了哪个项目、用了哪些查询、有哪些覆盖缺口，不要编造没跑过的查询。
 
+## 三步预检：把结论交给 subagent 之前
+
+`/plan`、`/implement` 这类要把上下文交给 scout 的流程，主 Agent 先做一次只读预检。
+预检的职责是**判断 CBM 的结论现在可不可信**，不是替 scout 做检索。固定三步，任一步不过就让 CBM 退场：
+
+1. `list_projects` 拿项目名。**若本仓库出现多个 `root_path` 相同的项目，逐个跑 `check_index_coverage`
+   比较 `indexed_at` 和 `generation_matches`，选新鲜的那个**，并写明选了哪个、为什么。不得按名字长短或返回顺序猜。
+2. 对本次最可能涉及的 1-3 个路径跑 `check_index_coverage --project <项目名> --paths '<路径>'`。
+   **禁止用 `index_status` 判覆盖**（理由见上面的「纪律」）。
+3. 只有体检通过（`generation_matches: true` 且 `status` 正常）才允许追加查询，且限 `get_architecture`
+   看架构、`search_code` 做定位。`search_graph` 仅在已知英文符号名、要追调用关系时用。
+
+体检不通过、覆盖不明、CBM 不可用或查询返回空 → **立刻停止 CBM，不要再补搜索**，把检索完整交给 scout。
+纯配置、文档或 CBM 不适用的内容直接跳过预检。不得为了用 CBM 擅自安装、启动或索引项目。
+
+交接给 scout 的 `【CBM 预检结果】` 必须包含：所选项目名与理由、索引时间与体检结论、实际执行过的查询、
+已确认的路径/符号（没有就写"无"）、覆盖缺口。CBM 不可用或索引陈旧时明确写
+"索引陈旧/CBM 不可用，未获得可信线索，全部走文件工具"。不得编造未执行的查询。
+
 ## 非交互模式下的命令写法
 
 subagent 的权限网关按引号解析命令：参数里出现 `|`、`*`、`?`、`#`、`!` 时必须**用单引号包起来**，否则整条命令被拒。
