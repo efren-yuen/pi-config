@@ -5,13 +5,10 @@
  * 纪律：任何失败都静默跳过。诊断是锦上添花，绝不能因为语言服务器没起来就拖慢或打断编辑。
  */
 import { execFile } from "node:child_process";
-import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolResultEventResult } from "@earendil-works/pi-coding-agent";
 
 const LSP_CLI = "/home/efren/.pi/agent/bin/lsp";
-const GLOBAL_CONFIG = path.join(os.homedir(), ".pi", "agent", "lsp", "servers.json");
 /** 语言服务器冷启动时这一次会超时，静默跳过；daemon 在后台继续起，下一次编辑就有诊断了。 */
 const DIAGNOSTIC_TIMEOUT_MS = 5000;
 const MAX_ITEMS = 20;
@@ -32,20 +29,6 @@ interface Diagnostic {
 
 /** 支持的扩展名从 CLI 问一次就缓存，省得对着 .md、.json 也去 spawn 一个进程。 */
 let supportedExtensions: Set<string> | null = null;
-
-function readAutoDiagnostics(file: string): boolean | undefined {
-	try {
-		const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as { autoDiagnostics?: unknown };
-		return typeof parsed.autoDiagnostics === "boolean" ? parsed.autoDiagnostics : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-/** 项目级 .pi/lsp.json 优先于全局 servers.json，两者都没写就默认开启。 */
-function autoDiagnosticsEnabled(cwd: string): boolean {
-	return readAutoDiagnostics(path.join(cwd, ".pi", "lsp.json")) ?? readAutoDiagnostics(GLOBAL_CONFIG) ?? true;
-}
 
 function execJson(args: string[], timeoutMs: number, cwd: string): Promise<unknown | null> {
 	return new Promise((resolve) => {
@@ -78,8 +61,8 @@ async function loadSupportedExtensions(cwd: string): Promise<Set<string>> {
 	return set;
 }
 
-function formatBlock(file: string, diagnostics: Diagnostic[]): string {
-	const relative = path.relative(process.cwd(), file) || file;
+function formatBlock(file: string, diagnostics: Diagnostic[], cwd: string): string {
+	const relative = path.relative(cwd, file) || file;
 	const shown = diagnostics.slice(0, MAX_ITEMS);
 	const lines = shown.map((item) => {
 		const line = (item.range?.start?.line ?? 0) + 1;
@@ -123,7 +106,6 @@ export default function lspDiagnostics(pi: ExtensionAPI): void {
 
 	pi.on("tool_result", async (event, ctx): Promise<ToolResultEventResult | undefined> => {
 		if (!WATCHED_TOOLS.has(event.toolName) || event.isError) return undefined;
-		if (!autoDiagnosticsEnabled(ctx.cwd)) return undefined;
 		const rawPath = (event.input as { path?: unknown } | undefined)?.path;
 		if (typeof rawPath !== "string" || rawPath.length === 0) return undefined;
 
@@ -154,6 +136,6 @@ export default function lspDiagnostics(pi: ExtensionAPI): void {
 		// 干净就什么都不加，别制造噪音。
 		if (diagnostics.length === 0) return undefined;
 
-		return { content: [...event.content, { type: "text", text: formatBlock(file, diagnostics) }] };
+		return { content: [...event.content, { type: "text", text: formatBlock(file, diagnostics, ctx.cwd) }] };
 	});
 }

@@ -211,16 +211,17 @@ function isPlainObject(value) {
 }
 
 /**
- * 合并三层配置：内置默认 < ~/.pi/agent/lsp/servers.json < <工作区>/.pi/lsp.json。
- * 项目级放最后，老项目要指定 JDK 之类的就写在那里。
+ * 两层配置：内置默认 < ~/.pi/agent/lsp/servers.json。
+ *
+ * 刻意不读项目里的 .pi/lsp.json：那一层能覆盖 command 和 env，而 lsp-diagnostics 扩展
+ * 在每次 edit/write 之后自动跑 diag——等于 clone 一个仓库、改一个文件，仓库里写的命令
+ * 就在本机跑起来了，全程无提示。要给某个项目单独配 JDK 之类，写到全局 servers.json 里。
  */
-function loadConfig(projectRoot) {
+function loadConfig() {
 	const global = readJson(CONFIG_FILE) ?? {};
-	const project = projectRoot ? readJson(path.join(projectRoot, ".pi", "lsp.json")) ?? {} : {};
-	const merged = { autoDiagnostics: true, servers: {} };
-	merged.autoDiagnostics = project.autoDiagnostics ?? global.autoDiagnostics ?? true;
-	for (const id of new Set([...Object.keys(BUILTIN_SERVERS), ...Object.keys(global.servers ?? {}), ...Object.keys(project.servers ?? {})])) {
-		merged.servers[id] = deepMerge(deepMerge(BUILTIN_SERVERS[id] ?? {}, global.servers?.[id] ?? {}), project.servers?.[id] ?? {});
+	const merged = { servers: {} };
+	for (const id of new Set([...Object.keys(BUILTIN_SERVERS), ...Object.keys(global.servers ?? {})])) {
+		merged.servers[id] = deepMerge(BUILTIN_SERVERS[id] ?? {}, global.servers?.[id] ?? {});
 	}
 	return merged;
 }
@@ -245,23 +246,19 @@ function findRoot(file, markers) {
 function resolveServer(file, explicitId) {
 	const abs = path.resolve(file);
 	const ext = path.extname(abs).toLowerCase();
-	// 先用不带项目层的配置挑出服务器，拿到 root 之后再读项目级配置重新合并。
-	const bootstrap = loadConfig(null);
+	const config = loadConfig();
 	let id = explicitId;
 	if (!id) {
-		id = Object.keys(bootstrap.servers).find((key) => {
-			const entry = bootstrap.servers[key];
+		id = Object.keys(config.servers).find((key) => {
+			const entry = config.servers[key];
 			return !entry.disabled && (entry.extensions ?? []).includes(ext);
 		});
 	}
 	if (!id) throw new UserError(`没有为 ${ext || abs} 配置语言服务器。用 'lsp servers' 看已注册的服务器。`);
-	const entry0 = bootstrap.servers[id];
-	if (!entry0) throw new UserError(`未知的服务器 id: ${id}`);
-	const root = findRoot(abs, entry0.rootMarkers);
-	const config = loadConfig(root);
 	const entry = config.servers[id];
+	if (!entry) throw new UserError(`未知的服务器 id: ${id}`);
 	if (entry.disabled) throw new UserError(`服务器 ${id} 已在配置里禁用。`);
-	return { id, config: entry, root, autoDiagnostics: config.autoDiagnostics };
+	return { id, config: entry, root: findRoot(abs, entry.rootMarkers) };
 }
 
 /** 内置 command 是函数（依赖工作区），配置文件覆盖的是数组。 */
@@ -815,7 +812,7 @@ async function runDaemon(serverId, root) {
 	const logStream = fs.createWriteStream(logFile, { flags: "a" });
 	const log = (line) => logStream.write(`[${new Date().toISOString()}] ${line}\n`);
 
-	const config = loadConfig(root);
+	const config = loadConfig();
 	const entry = config.servers[serverId];
 	if (!entry) {
 		log(`未知服务器 ${serverId}`);
@@ -857,13 +854,15 @@ async function runDaemon(serverId, root) {
 
 	server.on("connection", (conn) => {
 		resetIdle();
-		let buffer = "";
+		// 按 Buffer 累积再一次性 toString：chunk 在 TCP 边界上会切开多字节字符，
+		// 逐块 toString 会各产生一个 U+FFFD，中文消息就此变成乱码。
+		let buffer = Buffer.alloc(0);
 		conn.on("data", async (chunk) => {
-			buffer += chunk.toString("utf8");
-			const newline = buffer.indexOf("\n");
+			buffer = Buffer.concat([buffer, chunk]);
+			const newline = buffer.indexOf(0x0a);
 			if (newline < 0) return;
-			const line = buffer.slice(0, newline);
-			buffer = "";
+			const line = buffer.subarray(0, newline).toString("utf8");
+			buffer = buffer.subarray(newline + 1);
 			let payload;
 			try {
 				payload = JSON.parse(line);
@@ -977,11 +976,11 @@ async function daemonRequest(serverId, root, payload, { startTimeoutMs = 30_000 
 		if (!conn) throw new UserError(`起不来 ${serverId} 的 daemon。看日志：${logPath(serverId, root)}`);
 	}
 	return new Promise((resolve, reject) => {
-		let buffer = "";
-		conn.on("data", (chunk) => { buffer += chunk.toString("utf8"); });
+		const chunks = [];
+		conn.on("data", (chunk) => chunks.push(chunk));
 		conn.on("end", () => {
 			try {
-				resolve(JSON.parse(buffer.trim()));
+				resolve(JSON.parse(Buffer.concat(chunks).toString("utf8").trim()));
 			} catch (err) {
 				reject(new Error(`daemon 返回的不是合法 JSON: ${err.message}`));
 			}
@@ -998,10 +997,10 @@ async function daemonRequestIfRunning(serverId, root, payload) {
 	const conn = await tryConnect(sock);
 	if (!conn) return null;
 	return new Promise((resolve) => {
-		let buffer = "";
-		conn.on("data", (chunk) => { buffer += chunk.toString("utf8"); });
+		const chunks = [];
+		conn.on("data", (chunk) => chunks.push(chunk));
 		conn.on("end", () => {
-			try { resolve(JSON.parse(buffer.trim())); } catch { resolve(null); }
+			try { resolve(JSON.parse(Buffer.concat(chunks).toString("utf8").trim())); } catch { resolve(null); }
 		});
 		conn.on("error", () => resolve(null));
 		conn.write(JSON.stringify(payload) + "\n");
@@ -1233,7 +1232,7 @@ async function installServers(ids, options) {
 
 /** 每项服务器实际解析到什么、能不能用 —— 当 doctor 使。 */
 function reportServers(asJson) {
-	const config = loadConfig(null);
+	const config = loadConfig();
 	const rows = [];
 	for (const [id, entry] of Object.entries(config.servers)) {
 		entry.__id = id;
