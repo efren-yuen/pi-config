@@ -30,6 +30,8 @@ const NODE_BIN = path.join(SERVERS_DIR, "node_modules", ".bin");
 const JDTLS_DIR = path.join(SERVERS_DIR, "jdtls");
 const LUA_DIR = path.join(SERVERS_DIR, "lua-language-server");
 
+/** 日志保留天数：daemon 启动时顺手清一次，否则每个 (服务器, 工作区) 组合都会永久留一个文件。 */
+const LOG_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 /** daemon 空闲多久自动退出。PI_LSP_IDLE_MS 只为测试用，正常不需要设。 */
 const IDLE_TIMEOUT_MS = Number(process.env.PI_LSP_IDLE_MS) || 30 * 60 * 1000;
 /** 单次 LSP 请求的默认超时。 */
@@ -786,10 +788,28 @@ function logPath(serverId, root) {
 	return path.join(LOG_DIR, `${serverId}-${hash(root)}.log`);
 }
 
+/**
+ * 清掉超过保留期的日志。纪律和 notify/lsp-diagnostics 一致：任何失败都静默跳过，
+ * 清理是锦上添花，绝不能拖慢或挡住 daemon 启动。当前正在写的那个文件 mtime 是新的，不会被误删。
+ */
+function pruneLogs() {
+	try {
+		const deadline = Date.now() - LOG_RETENTION_MS;
+		for (const name of fs.readdirSync(LOG_DIR)) {
+			if (!name.endsWith(".log")) continue;
+			const file = path.join(LOG_DIR, name);
+			try {
+				if (fs.statSync(file).mtimeMs < deadline) fs.unlinkSync(file);
+			} catch {}
+		}
+	} catch {}
+}
+
 /** daemon 进程入口：起一个语言服务器，然后在 unix socket 上收请求。 */
 async function runDaemon(serverId, root) {
 	fs.mkdirSync(SOCK_DIR, { recursive: true });
 	fs.mkdirSync(LOG_DIR, { recursive: true });
+	pruneLogs();
 	const sock = socketPath(serverId, root);
 	const logFile = logPath(serverId, root);
 	const logStream = fs.createWriteStream(logFile, { flags: "a" });
