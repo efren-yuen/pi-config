@@ -28,7 +28,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
+import { type AgentConfig, type AgentScope, discoverAgents, formatAgentList } from "./agents.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
@@ -440,13 +440,19 @@ async function runSingleAgent(
 }
 
 const TaskItem = Type.Object({
-	agent: Type.String({ description: "Name of the agent to invoke" }),
+	agent: Type.String({
+		description:
+			"Name of the agent to invoke — must be one of the agents listed under 'Available agents' in the tool description. Never 'user'/'project'/'both': those are agentScope values, not agent names.",
+	}),
 	task: Type.String({ description: "Task to delegate to the agent" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 });
 
 const ChainItem = Type.Object({
-	agent: Type.String({ description: "Name of the agent to invoke" }),
+	agent: Type.String({
+		description:
+			"Name of the agent to invoke — must be one of the agents listed under 'Available agents' in the tool description. Never 'user'/'project'/'both': those are agentScope values, not agent names.",
+	}),
 	task: Type.String({
 		description:
 			"Task for this step. To receive the previous step's output, include the literal string {previous} — it is substituted verbatim. Describing the dependency in prose (e.g. 'wait for scout output') does NOT work: the step runs immediately with that prose as its entire task.",
@@ -460,7 +466,12 @@ const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 });
 
 const SubagentParams = Type.Object({
-	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
+	agent: Type.Optional(
+		Type.String({
+			description:
+				"Name of the agent to invoke in single mode — must be one of the agents listed under 'Available agents' in the tool description. Never 'user'/'project'/'both': those are agentScope values, not agent names.",
+		}),
+	),
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution" })),
 	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task} for sequential execution" })),
@@ -472,6 +483,10 @@ const SubagentParams = Type.Object({
 });
 
 export default function (pi: ExtensionAPI) {
+	// 注册时先发现用户级 agent，把真实名单写进工具描述，避免模型凭空猜 agent 名
+	const startupAgents = discoverAgents(process.cwd(), "user").agents;
+	const { text: startupAgentList, remaining: startupAgentsRemaining } = formatAgentList(startupAgents, 10);
+
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
@@ -481,6 +496,7 @@ export default function (pi: ExtensionAPI) {
 			"single (agent + task) — one task.",
 			"parallel (tasks array) — two or more tasks that do NOT need each other's output, e.g. surveying separate modules or fixing unrelated files. Runs 4 at a time (max 8) and returns every result, so it is both faster and more informative. Prefer it whenever the tasks are independent.",
 			"chain (chain array) — each step needs the previous step's output, which it receives via the literal {previous} placeholder. Costs one full round-trip per step and returns ONLY the last step's output, so earlier steps' findings are lost unless the last step repeats them. Use it only for genuine dependencies such as scout then planner.",
+			`Available agents: ${startupAgentList}${startupAgentsRemaining > 0 ? ` (+${startupAgentsRemaining} more)` : ""}`,
 			`Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
 			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
 		].join(" "),
@@ -680,11 +696,16 @@ export default function (pi: ExtensionAPI) {
 						: "completed";
 					return `### [${r.agent}] ${status}\n\n${output}`;
 				});
+				// 全部失败时补一句可行动的提示，避免模型把 0/N 当成"已尝试过"而直接放弃
+				const allFailedHint =
+					successCount === 0
+						? `\n\nNo task ran. Fix the cause above (a wrong agent name is the usual one — see "Available agents") and call subagent again; nothing has been done yet.`
+						: "";
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n---\n\n")}`,
+							text: `Parallel: ${successCount}/${results.length} succeeded${allFailedHint}\n\n${summaries.join("\n\n---\n\n")}`,
 						},
 					],
 					details: makeDetails("parallel")(results),
