@@ -14,3 +14,6 @@
 
 # 本机其他工具配置
 /.claude/
+
+# 手机遥控桥的凭据
+/mobile-bridge.json

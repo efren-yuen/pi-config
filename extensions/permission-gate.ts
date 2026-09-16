@@ -27,6 +27,10 @@ const SENSITIVE_SEGMENT = new RegExp(String.raw`^(?:${SENSITIVE})$`, "i");
 /** subagent 联网不好控额度，这一条单独留着；主 Agent 不受限。 */
 const WEB_CLI = /(?:^|\/)web\s+(?:search|fetch)\b/;
 
+/**
+ * 只用于匹配：把换行、制表符等控制字符压成空格，免得正则被换行绕过。
+ * 压扁后的串**不能**拿回去执行——多行脚本和 heredoc 会被它毁掉。
+ */
 function normalizeCommand(value: unknown): string {
 	return typeof value === "string" ? value.replace(/[\u0000-\u001f]/g, " ").replace(/\s+/g, " ").trim() : "";
 }
@@ -116,7 +120,6 @@ export default function permissionGate(pi: ExtensionAPI): void {
 		if (!isToolCallEventType("bash", event) && !isToolCallEventType("powershell", event)) return undefined;
 		const command = normalizeCommand(event.input.command);
 		if (!command) return { block: true, reason: "Denied: empty or invalid bash command." };
-		event.input.command = command;
 		const verdict = assess(command, ctx.hasUI);
 		return verdict ? { block: true, reason: verdict.reason, terminate: verdict.fatal } : undefined;
 	});
@@ -124,7 +127,6 @@ export default function permissionGate(pi: ExtensionAPI): void {
 	pi.on("user_bash", async (event, ctx): Promise<UserBashEventResult | undefined> => {
 		const command = normalizeCommand(event.command);
 		if (!command) return deniedBash("Empty or invalid bash command.");
-		event.command = command;
 		const verdict = assess(command, ctx.hasUI);
 		return verdict ? deniedBash(verdict.reason) : undefined;
 	});
