@@ -1,6 +1,6 @@
 {
   "defaultProvider": "opencode-go",
-  "defaultModel": "qwen3.8-flash",
+  "defaultModel": "glm-5.3-flash",
   "lastChangelogVersion": "0.85.1",
   "theme": "gruvbox-dark",
   "defaultProjectTrust": "ask",
@@ -33,7 +33,11 @@
     "opencode-go/qwen3.7-plus": "medium",
     "opencode-go/gpt-5.6-luna": "high",
     "openai-codex/gpt-5.6-terra": "high",
-    "opencode-go/deepseek-v4-flash": "low"
+    "opencode-go/deepseek-v4.1-flash": "high",
+    "opencode-go/glm-5.3-flash": "high"
   },
-  "packages": []
+  "packages": [
+    "npm:@juicesharp/rpiv-todo"
+  ],
+  "hideThinkingBlock": false
 }
