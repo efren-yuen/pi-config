@@ -67,8 +67,14 @@ python3 -c "import json; json.load(open('/home/efren/.pi/agent/settings.json'));
 
 `extensions/subagent/` 复制自 pi 自带的
 `/usr/lib/node_modules/pi/packages/coding-agent/examples/extensions/subagent/`。
-`agents.ts` 与上游完全一致；`index.ts` 只改了两处 tool description 文案
-（澄清 `{previous}` 必须字面写、说明 parallel/chain 按数据依赖选）。
+`agents.ts` 与上游完全一致；`index.ts` 改了三处：
+
+1. 顶部多 import `formatAgentList`（来自本地 `agents.ts`）。
+2. `export default` 开头启动时 `discoverAgents()`，把真实 agent 名单写进工具描述
+   （`startupAgentList`），避免模型凭空猜 agent 名；若 agent 超过 10 个会截断并提示剩余数。
+3. `TaskItem` / `ChainItem` / `SubagentParams.agent` 的 tool description 文案
+   （澄清 agent 名必须来自名单、agentScope 值不是 agent 名，以及 `{previous}` 必须字面写、
+   parallel/chain 按数据依赖选）。
 
 `pi update` 之后上游修的 bug 不会自动进来，而且没有任何提示。升级后查一次漂移：
 
@@ -77,7 +83,7 @@ diff -u /usr/lib/node_modules/pi/packages/coding-agent/examples/extensions/subag
         ~/.pi/agent/extensions/subagent/index.ts
 ```
 
-只看到那两个 hunk 就是没漂；多出别的说明上游改了，需要手工合。
+只看到上面这三处 hunk 就是没漂；多出别的说明上游改了，需要手工合。
 
 ## 权限网关是黑名单，不要往回改成白名单
 
@@ -92,7 +98,9 @@ git force push、命令文本引用受保护路径、把凭据或环境变量喂
 
 ## 新能力写 skill + CLI，不装 MCP server
 
-pi 已经彻底去掉 MCP。要加外部能力就写一个 CLI 放 `bin/`，配一份 SKILL.md 说明用法，再进网关白名单。
+pi 已经彻底去掉 MCP。要加外部能力就写一个 CLI 放 `bin/`，配一份 SKILL.md 说明用法。
+网关是黑名单，不需要也不应该给新 CLI 加白名单；若 CLI 要限制 subagent 联网等场景，
+参照 `WEB_CLI` 在 `permission-gate.ts` 里加一条黑名单规则，并保持规则数最小。
 
 注意「调用某个 MCP 端点」和「挂一个 MCP server」是两回事——前者一个 HTTP POST 就够，不需要跑进程。
 
