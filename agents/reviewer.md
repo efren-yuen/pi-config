@@ -1,7 +1,7 @@
 ---
 name: reviewer
 description: 只读审查已实施变更，可运行只读检查但绝不修改文件。
-model: openai-codex/gpt-5.6-terra:high
+model: openai-codex/gpt-6-sol:high
 tools: read, grep, find, ls, bash
 ---
 

@@ -1,0 +1,206 @@
+#!/usr/bin/env node
+/**
+ * pi 的 Jev 决策 CLI，走 OpenRouter 的 /api/alpha/decisions 端点。
+ * Jev 是类型化决策模型：不生成文本，返回 choice/noul/score + 校准概率。
+ *
+ * 用法:
+ *   jev ask '<JSON 请求体>'          发送完整请求体（state/questions/model）
+ *   jev triage '<任务描述>'          内置「需求分流」预设：任务分类 + 影响面判断
+ *   jev -h                           帮助
+ *
+ * 输出:
+ *   默认打印格式化的人类可读结果（含路由建议）；
+ *   --json 打印原始 JSON（供脚本管道解析）。
+ *
+ * 环境变量:
+ *   OPENROUTER_API_KEY               必填
+ *   JEV_MODEL                        可选，默认 typesafe/jev-1.13
+ *   JEV_TIMEOUT_MS                   可选，默认 15000
+ */
+
+const OPENROUTER_DECISIONS_URL = "https://openrouter.ai/api/alpha/decisions";
+const DEFAULT_MODEL = "typesafe/jev-1.13";
+const DEFAULT_TIMEOUT_MS = 15_000;
+const MAX_STATE_CHARS = 60_000; // Jev 单请求 64k token，留足余量截断
+
+const USAGE = `用法:
+  jev ask '<JSON 请求体>'       发送完整请求体（state / questions，可选 model）
+  jev triage '<任务描述>'       需求分流预设：分类任务 + 评估影响面与风险
+  jev -h, --help                显示本帮助
+
+通用选项:
+  --json                        输出原始 JSON（默认人类可读 + 路由建议）
+
+环境变量:
+  OPENROUTER_API_KEY            必填，OpenRouter 的 key
+  JEV_MODEL                     可选，默认 ${DEFAULT_MODEL}
+  JEV_TIMEOUT_MS                可选，默认 ${DEFAULT_TIMEOUT_MS}
+
+成本参考: 一次三问请求约 \$0.00002（输入 \$0.042/MTok，输出免费）。`;
+
+function fail(message) {
+	process.stderr.write(`jev: ${message}\n`);
+	process.exit(1);
+}
+
+function parseArgs(argv) {
+	const args = { json: false, positional: [] };
+	for (let i = 0; i < argv.length; i++) {
+		const a = argv[i];
+		if (a === "--json") args.json = true;
+		else if (a === "-h" || a === "--help") {
+			process.stdout.write(USAGE + "\n");
+			process.exit(0);
+		} else args.positional.push(a);
+	}
+	return args;
+}
+
+/** 「需求分流」预设问题集：分类 + 影响面 + 破坏性，一次请求全出 */
+function triageQuestions() {
+	return {
+		category: {
+			type: "choice",
+			instructions: "判断这条需求属于哪一类。",
+			criteria: {
+				query: "查询、解释、分析代码或概念，不改文件",
+				single_file: "单文件改动，或改动集中在一个文件内，影响面清楚",
+				multi_file: "跨文件改动，或影响面涉及调用方、依赖、配置等多处，不清楚",
+				chore: "与代码无关的杂务（写文档、配置工具、环境操作等）",
+			},
+		},
+		clear_scope: {
+			type: "noul",
+			instructions: "判断改动影响面是否清楚（调用方、副作用、兼容性都能预见）。",
+			criteria: {
+				true: "影响面清楚，可以预见所有受影响位置",
+				false: "影响面不清楚，或存在隐性调用方、跨模块副作用",
+			},
+		},
+		risk: {
+			type: "score",
+			instructions:
+				"评估如果直接实施、不做额外审查，出错造成的破坏程度。查询/解释类任务一律打 0。",
+			criteria: ["可随手回滚", "局部影响，需回归测试", "影响核心逻辑，需仔细审查", "涉及数据、安全或不可逆操作"],
+		},
+	};
+}
+
+/** 人类可读输出 + 按现有 AGENTS.md 纪律生成路由建议 */
+function formatResult(request, response) {
+	const lines = [];
+	const answers = response.answers ?? {};
+	const usage = response.usage;
+
+	for (const [key, ans] of Object.entries(answers)) {
+		if (ans.type === "noul") {
+			lines.push(`${key}: ${ans.noul} （P=yes，置信度 ${ans.confidence ?? "n/a"}）`);
+		} else if (ans.type === "choice") {
+			const probs = Object.entries(ans.probabilities ?? {})
+				.map(([k, v]) => `${k}=${v}`)
+				.join(", ");
+			lines.push(`${key}: ${ans.choice} （置信度 ${ans.confidence ?? "n/a"}；${probs}）`);
+		} else if (ans.type === "score") {
+			const legend = Object.entries(ans.legend ?? {})
+				.map(([k, v]) => `${k}=${v}`)
+				.join(", ");
+			lines.push(`${key}: ${ans.score} （${legend}；置信度 ${ans.confidence ?? "n/a"}）`);
+		}
+	}
+
+	// 路由建议：对齐 AGENTS.md 的「单文件自己干 / 跨文件走 plan」纪律
+	if (answers.category && answers.clear_scope) {
+		const cat = answers.category.choice;
+		const clear = answers.clear_scope.noul;
+		const risk = typeof answers.risk?.score === "number" ? answers.risk.score : null;
+		let route;
+		// 风险检查最先做（fail-closed）：不管分类是什么，高风险一律先走 plan
+		if (risk !== null && risk >= 2.5) route = "高风险改动 —— 走 /plan，实施前需人工确认";
+		else if ((cat === "multi_file" || (cat !== "query" && clear < 0.5 && risk >= 0.5)) && cat !== "query")
+			route = "影响面不清楚 —— 走 /plan，等确认后再 /implement";
+		else if (cat === "query") route = "单文件改动、查询、解释 —— 自己做完，不起 subagent";
+		else if (cat === "chore" && clear >= 0.5) route = "低风险杂务 —— 自己做，不必建任务清单";
+		else route = "单文件改动、影响面清楚 —— 自己做完（3 步以上仍建议建 todo）";
+		lines.push("", `路由建议: ${route}`);
+	}
+
+	if (usage) {
+		lines.push(
+			`（${usage.input_tokens ?? "?"} 输入 token / ${usage.output_tokens ?? 0} 输出 / $${usage.cost ?? "?"} / ${response.provider ?? "?"}）`,
+		);
+	}
+	return lines.join("\n");
+}
+
+async function main() {
+	const args = parseArgs(process.argv.slice(2));
+	const command = args.positional[0];
+
+	const apiKey = process.env.OPENROUTER_API_KEY;
+	if (!apiKey) fail("OPENROUTER_API_KEY 未设置。export OPENROUTER_API_KEY=sk-or-... 后重试。");
+
+	let requestBody;
+	if (command === "ask") {
+		const raw = args.positional.slice(1).join(" ");
+		if (!raw) fail("ask 需要一个 JSON 请求体参数，例如: jev ask '{\"state\":\"...\",\"questions\":{...}}'");
+		try {
+			requestBody = JSON.parse(raw);
+		} catch (e) {
+			fail(`请求体不是合法 JSON: ${e.message}`);
+		}
+		if (!requestBody.state || !requestBody.questions)
+			fail('请求体必须包含 "state" 和 "questions" 字段');
+	} else if (command === "triage") {
+		const state = args.positional.slice(1).join(" ").trim();
+		if (!state) fail("triage 需要任务描述，例如: jev triage '把用户表加一个手机号字段'");
+		requestBody = {
+			state: state.length > MAX_STATE_CHARS ? state.slice(0, MAX_STATE_CHARS) : state,
+			questions: triageQuestions(),
+		};
+	} else {
+		fail(`未知命令 "${command ?? ""}"。\n${USAGE}`);
+	}
+
+	if (!requestBody.model) requestBody.model = process.env.JEV_MODEL || DEFAULT_MODEL;
+
+	const timeoutMs = Number(process.env.JEV_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS;
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+	let res;
+	try {
+		res = await fetch(OPENROUTER_DECISIONS_URL, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${apiKey}`,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify(requestBody),
+			signal: controller.signal,
+		});
+	} catch (e) {
+		fail(e.name === "AbortError" ? `请求超时（${timeoutMs}ms）` : `网络错误: ${e.message}`);
+	} finally {
+		clearTimeout(timer);
+	}
+
+	const text = await res.text();
+	if (!res.ok) {
+		fail(`Jev 请求失败 HTTP ${res.status}: ${text.slice(0, 2000)}`);
+	}
+
+	let json;
+	try {
+		json = JSON.parse(text);
+	} catch {
+		fail(`响应不是合法 JSON: ${text.slice(0, 500)}`);
+	}
+
+	if (args.json) {
+		process.stdout.write(JSON.stringify(json, null, 2) + "\n");
+	} else {
+		process.stdout.write(formatResult(requestBody, json) + "\n");
+	}
+}
+
+main();
