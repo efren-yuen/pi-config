@@ -117,6 +117,28 @@ export default function permissionGate(pi: ExtensionAPI): void {
 			return undefined;
 		}
 
+		// MCP 工具名形如 mcp__<server>__<tool>，上面那条路径检查覆盖不到，server 进程本身也有完整文件权限。
+		// 按 server 声明的注解判断：只读的放行，其余交互模式下确认、非交互模式下拒绝（fail-closed）。
+		// 缺注解时按 MCP 默认值处理——非只读、可能破坏、可能触及开放世界。
+		if (event.toolName.startsWith("mcp__")) {
+			const hints = pi.getAllTools().find((tool) => tool.name === event.toolName)?.annotations;
+			const needsApproval =
+				hints?.destructiveHint === true ||
+				(!hints?.readOnlyHint && ((hints?.destructiveHint ?? true) || (hints?.openWorldHint ?? true)));
+			if (needsApproval) {
+				if (!ctx.hasUI) {
+					return {
+						block: true,
+						reason: "Denied: MCP tool is not read-only and no UI is available to confirm it.",
+					};
+				}
+				if (!(await ctx.ui.confirm(`Allow ${event.toolName}?`, event.toolName))) {
+					return { block: true, reason: `Denied: ${event.toolName} was not approved.` };
+				}
+			}
+			return undefined;
+		}
+
 		if (!isToolCallEventType("bash", event) && !isToolCallEventType("powershell", event)) return undefined;
 		const command = normalizeCommand(event.input.command);
 		if (!command) return { block: true, reason: "Denied: empty or invalid bash command." };

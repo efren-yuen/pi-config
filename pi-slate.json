@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "surfaces": ["tool-cards"],
+  "composerMetadata": "standard",
+  "density": "comfortable",
+  "focused": true,
+  "toolStyle": "claudecode"
+}

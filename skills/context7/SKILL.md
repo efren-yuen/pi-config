@@ -1,40 +1,44 @@
 ---
 name: context7
-description: 用 c7 CLI 查库、框架、SDK、CLI 工具的最新官方文档与代码示例（Vue、Spring Boot、React、Prisma 等）。涉及 API 语法、配置、版本迁移、库特定的报错排查时使用，不要凭记忆回答。
+description: 用 context7（MCP）查库、框架、SDK、CLI 工具的最新官方文档与代码示例（Vue、Spring Boot、React、Prisma 等）。涉及 API 语法、配置、版本迁移、库特定的报错排查时使用，不要凭记忆回答。
 ---
 
 # Context7 文档查询
 
-CLI 在 `/home/efren/.pi/agent/bin/c7`（不在 PATH 里，用绝对路径调用）。
+默认走 MCP：`mcp__context7__resolve_library_id` → `mcp__context7__query_docs`。
+需要大段文档时用 CLI `/home/efren/.pi/agent/bin/c7 docs <id> <主题> --tokens 16000`（MCP 没有 tokens 参数）。
 
-## 两步走：先 search 拿 id，再 docs 取正文
+## 两步走
 
-```bash
-/home/efren/.pi/agent/bin/c7 search vue router
-# /vuejs/vue-router | Vue Router | trust=9.7 bench=66 snippets=266
-# /websites/router_vuejs | Vue Router | trust=10 bench=84 snippets=863
+```js
+// 1. 拿 id
+const r = await tools.mcp__context7__resolve_library_id({ libraryName: "Vue Router", query: "navigation guards" });
+text(r.content.map((c) => c.text).join("\n"));
 
-/home/efren/.pi/agent/bin/c7 docs /vuejs/vue-router navigation guards
+// 2. 取文档
+const d = await tools.mcp__context7__query_docs({ libraryId: "/vuejs/vue-router", query: "navigation guards" });
+text(d.content.map((c) => c.text).join("\n"));
 ```
 
-```bash
-/home/efren/.pi/agent/bin/c7 search spring boot
-/home/efren/.pi/agent/bin/c7 docs /spring-projects/spring-boot actuator endpoints --tokens 8000
-```
+- 工具名是**下划线**：`resolve_library_id`、`query_docs`，不是 `resolve-library-id`。
+- `resolve_library_id` 的 `query` 必填，写清“要用它做什么”，比只给库名准。
+- `query_docs` 可选 `language`（如 `"TypeScript"`），同语言示例排前。
+- 库名用官方写法：`Next.js` 而不是 `nextjs`。
 
 ## 选 id 的依据
 
-`search` 每行给出 `id | 标题 | trust=可信度 bench=文档质量 snippets=片段数`。按名字精确匹配优先，其次看 trust / bench / snippets 都高的；带版本需求时用 `search` 输出里的 `versions`，拼成 `/org/project/版本` 传给 `docs`。
+返回里有 `Code Snippets`、`Source Reputation`（High/Medium/Low）、`Benchmark Score`。
+名字精确匹配优先，其次看三者都高的。需要特定版本时把版本拼进 id：`/org/project/版本`（版本列表要用 CLI `c7 search` 才看得到）。
 
-## 选项
+## 什么时候用 CLI
 
-- `--tokens N`：`docs` 返回的文档规模，默认 5000；主题窄可以调小，要通读某个模块再调大。
-- `--json`：`search` 输出原始 JSON（一般不需要）。
-- 主题词直接跟在 id 后面，多个词用空格：`c7 docs /prisma/docs migrations in production`。
+- 要通读某个模块、拉大段文档：`c7 docs /vuejs/vue-router navigation guards --tokens 16000`
+- 要找版本列表：`c7 search vue router`
+- MCP 被限流（429）：CLI 走同一后端，配 `CONTEXT7_API_KEY` 可提额
 
 ## 注意
 
-- 匿名调用有速率限制，被限流会提示 HTTP 429；需要高频使用时设 `CONTEXT7_API_KEY` 环境变量。
-- 文档接口偶尔慢（个别库 20s+），CLI 超时设的是 60s，失败会打印 HTTP 状态码并以非 0 退出。
-- 查不到库时不要硬猜 id，换关键词重新 `search`（例如用 "next.js" 而不是 "nextjs"）。
+- 匿名调用有速率限制，被限流会提示 429；高频用时设 `CONTEXT7_API_KEY`。
+- 文档接口偶尔慢（个别库 20s+），MCP 的 timeout 是 60s。
+- 查不到库时不要硬猜 id，换关键词重新 resolve（例如用 "next.js" 而不是 "nextjs"）。
 - 适用范围：库/框架/SDK/CLI 的用法与配置。重构、业务逻辑调试、代码审查这类问题不需要它。

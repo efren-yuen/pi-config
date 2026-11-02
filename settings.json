@@ -1,7 +1,7 @@
 {
   "defaultProvider": "opencode-go",
-  "defaultModel": "glm-5.3-flash",
-  "lastChangelogVersion": "0.87.1",
+  "defaultModel": "deepseek-v4.1-flash",
+  "lastChangelogVersion": "1.4.0",
   "theme": "gruvbox-material",
   "defaultProjectTrust": "ask",
   "compaction": {
@@ -38,7 +38,23 @@
   },
   "packages": [
     "npm:@juicesharp/rpiv-todo",
-    "npm:@juicesharp/rpiv-ask-user-question"
+    "npm:@juicesharp/rpiv-ask-user-question",
+    "npm:pi-slate"
   ],
-  "hideThinkingBlock": false
+  "hideThinkingBlock": false,
+  "tidy": {
+    "enabled": false,
+    "icons": false,
+    "frameMessages": false,
+    "groupTools": false,
+    "alwaysShowTools": [
+      "edit",
+      "write",
+      "bash",
+      "grep",
+      "find"
+    ],
+    "bashResultLines": 5,
+    "diffLines": 40
+  }
 }

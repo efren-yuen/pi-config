@@ -9,6 +9,7 @@
  * - 只在交互会话跑（ctx.hasUI），subagent 的非交互模式一律不跑，避免嵌套调用。
  */
 import { execFile } from "node:child_process";
+import { Text } from "@earendil-works/pi-tui";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const JEV_BIN = "/home/efren/.pi/agent/bin/jev";
@@ -31,7 +32,30 @@ function runTriage(prompt: string): Promise<string> {
 	});
 }
 
+/** 折叠态那一行：分类 + 风险分。路由建议只留在展开后的全文里。 */
+function summarize(triage: string): string {
+	const category = /^category: (\S+)/m.exec(triage)?.[1] ?? "?";
+	const risk = /^risk: ([\d.]+)/m.exec(triage)?.[1] ?? "?";
+	return `jev ${category} · risk ${risk}/3`;
+}
+
+/**
+ * 默认只画一行摘要，ctrl+o 展开全文。
+ * 渲染层折叠不影响上下文：模型收到的始终是完整的 content。
+ */
+function registerRenderer(pi: ExtensionAPI): void {
+	pi.registerMessageRenderer("jev_triage", (message, options, theme) => {
+		const summary = (message.details as { summary?: string } | undefined)?.summary ?? "jev";
+		const head = theme.fg("accent", "◆ ") + theme.fg("muted", summary);
+		if (!options.expanded) return new Text(head, options.outputPad, 0);
+		const body = typeof message.content === "string" ? message.content : "";
+		return new Text(`${head}\n${body}`, options.outputPad, 0);
+	});
+}
+
 export default function jevTriage(pi: ExtensionAPI): void {
+	registerRenderer(pi);
+
 	pi.on("before_agent_start", async (event, ctx: ExtensionContext) => {
 		if (!ctx.hasUI) return undefined;
 		const prompt = event.prompt?.trim() ?? "";
@@ -47,6 +71,7 @@ export default function jevTriage(pi: ExtensionAPI): void {
 				customType: "jev_triage",
 				content: `【Jev 需求分流（自动，决策支持非安全边界）】\n${triage}\n\n按路由建议行动；建议与实际代码事实冲突时，以代码为准并向用户说明。`,
 				display: true,
+				details: { summary: summarize(triage) },
 			},
 		};
 	});

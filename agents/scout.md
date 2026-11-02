@@ -1,7 +1,7 @@
 ---
 name: scout
 description: 只读侦察任务相关代码、配置和依赖关系，并返回压缩上下文。
-model: opencode-go/deepseek-v4-flash:low
+model: opencode-go/deepseek-v4.1-flash:low
 tools: read, grep, find, ls, bash
 ---
 
