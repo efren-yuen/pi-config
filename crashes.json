@@ -1,0 +1,12 @@
+[
+  {
+    "timestamp": "2026-09-28T10:04:11.215Z",
+    "version": "0.87.1",
+    "kind": "uncaught_exception",
+    "message": "read EIO",
+    "stack": "Error: read EIO\n    at TTY.onStreamRead (node:internal/stream_base_commons:216:20)",
+    "sessionFile": "/home/efren/.pi/agent/sessions/--home-efren-Workspace-project-biz_supplier_manage_master--/2026-09-28T08-12-27-335Z_01a0e712-8b47-7574-a210-cadac531cc76.jsonl",
+    "cwd": "/home/efren/Workspace/project/biz_supplier_manage_master",
+    "notified": true
+  }
+]
