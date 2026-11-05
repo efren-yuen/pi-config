@@ -2,7 +2,7 @@
   "mcpServers": {
     "cbm": {
       "command": "/usr/bin/codebase-memory-mcp",
-      "description": "代码图索引：符号搜索、调用链追踪、架构概览、变更影响面",
+      "description": "代码图索引（仅通过 MCP）：符号搜索、调用链追踪、架构概览、变更影响面；中文需求用 search_code；图查询前检查项目与索引新鲜度；空结果用文件检索核实；写操作需用户授权",
       "timeout": 120,
       "exposure": "codemode",
       "toolExposure": {
