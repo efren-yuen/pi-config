@@ -4,20 +4,11 @@
 
 ## 干活方式
 
-单文件改动、查询、解释 —— 自己做完，不要起 subagent。
-跨文件改动、影响面不清楚 —— 先按 `prompts/plan.md` 的流程出方案（scout → planner），等我确认后再按 `prompts/implement.md` 实施。
+- 单文件改动、查询、解释 —— 自己做完，不起 subagent。
+- 跨文件改动、影响面不清楚 —— 按 `prompts/plan.md` 先出方案（scout → planner），我确认后按 `prompts/implement.md` 实施。
+- 任何改动动手前先说清改哪里、为什么；3 步以上的活先建 todo（含调研）。
 
-「不要起 subagent」只免去子代理，不免去任务清单：3 步以上的活（含调研），先建 todo 再动手。
-
-动手前先说清楚要改哪里、为什么。
-
-## 查文档
-
-库/框架/SDK 文档一律走 `bin/c7`：`c7 search <关键词>` 找 id，`c7 docs <id> <主题> --tokens 16000` 拉文档。429 限流时设 `CONTEXT7_API_KEY`。
-
-## 数据库
-
-所有库操作走 tabularis MCP（`mcp__tabularis__*`：`list_connections` → `list_tables` / `describe_table` → `run_query`），不要另找 SQL 入口。MCP 侧默认只读，写操作需要我在客户端里开。
+本机工具在 `~/.pi/agent/bin`（c7 查库文档、lsp、web、jev），用法看各自 `--help`。
 
 ## 改动纪律
 
