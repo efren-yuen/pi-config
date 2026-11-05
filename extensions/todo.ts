@@ -36,10 +36,15 @@ const TodoParams = Type.Object({
 });
 
 const GLYPH: Record<Status, string> = {
-	pending: "[ ]",
-	in_progress: "[-]",
-	completed: "[x]",
+	pending: "○",
+	in_progress: "◐",
+	completed: "✓",
 };
+
+/** 输入框上方最多 5 行，超出收成一句，不挤占编辑区。 */
+const MAX_WIDGET_ROWS = 5;
+
+const WIDGET_KEY = "todo";
 
 /** 校验失败直接把原因抛回去，不改状态。 */
 function validate(tasks: Task[]): string | undefined {
@@ -60,6 +65,26 @@ function formatTasks(tasks: Task[]): string {
 	return lines.join("\n");
 }
 
+/** 输入框上方那张表的行。纯 UI 渲染，不进上下文。 */
+function widgetLines(list: Task[], theme: Theme): string[] {
+	if (list.length === 0) return [];
+	const done = list.filter((t) => t.status === "completed").length;
+	const shown = list.slice(0, MAX_WIDGET_ROWS);
+	const lines = shown.map((t, i) => {
+		const mark =
+			t.status === "completed"
+				? theme.fg("success", GLYPH[t.status])
+				: t.status === "in_progress"
+					? theme.fg("accent", GLYPH[t.status])
+					: theme.fg("dim", GLYPH[t.status]);
+		const body = t.status === "completed" ? theme.fg("dim", t.content) : theme.fg("muted", t.content);
+		return `${mark} ${i + 1}. ${body}`;
+	});
+	if (list.length > shown.length) lines.push(theme.fg("dim", `… 还有 ${list.length - shown.length} 条`));
+	lines.push(theme.fg("dim", `${done}/${list.length} 完成`));
+	return lines;
+}
+
 export default function (pi: ExtensionAPI) {
 	let tasks: Task[] = [];
 
@@ -75,8 +100,27 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
-	pi.on("session_start", async (_event, ctx) => reconstruct(ctx));
-	pi.on("session_tree", async (_event, ctx) => reconstruct(ctx));
+	/** 把当前表同步到输入框上方；空表就清掉 widget。 */
+	const refreshWidget = (ctx: ExtensionContext) => {
+		if (!ctx.hasUI) return;
+		if (tasks.length === 0) {
+			ctx.ui.setWidget(WIDGET_KEY, undefined);
+			return;
+		}
+		const snapshot = tasks.map((t) => ({ ...t }));
+		ctx.ui.setWidget(WIDGET_KEY, (_tui, theme) =>
+			new Text(widgetLines(snapshot, theme).join("\n"), 0, 0),
+		);
+	};
+
+	pi.on("session_start", async (_event, ctx) => {
+		reconstruct(ctx);
+		refreshWidget(ctx);
+	});
+	pi.on("session_tree", async (_event, ctx) => {
+		reconstruct(ctx);
+		refreshWidget(ctx);
+	});
 
 	pi.registerTool({
 		name: "todo",
@@ -85,7 +129,7 @@ export default function (pi: ExtensionAPI) {
 			"Keep a todo list for multi-step work. Submit the whole table each time; tasks: [] clears it. At most one task may be in_progress.",
 		parameters: TodoParams,
 
-		async execute(_toolCallId, params) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const next = params.tasks as Task[];
 			const error = validate(next);
 			if (error) {
@@ -95,6 +139,7 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 			tasks = next.map((t) => ({ content: t.content.trim(), status: t.status }));
+			refreshWidget(ctx);
 			return {
 				content: [{ type: "text", text: formatTasks(tasks) }],
 				details: { tasks: [...tasks] } as TodoDetails,
