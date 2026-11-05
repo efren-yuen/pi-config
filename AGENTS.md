@@ -7,6 +7,7 @@
 - 单文件改动、查询、解释 —— 自己做完，不起 subagent。
 - 跨文件改动、影响面不清楚 —— 按 `prompts/plan.md` 先出方案（scout → planner），我确认后按 `prompts/implement.md` 实施。
 - 任何改动动手前先说清改哪里、为什么；3 步以上的活先建 todo（含调研）。
+- todo 随做随标：开工前标 in_progress，做完立刻标 completed，不攒到最后统一补。
 
 本机工具在 `~/.pi/agent/bin`（c7 查库文档、lsp、web、jev），用法看各自 `--help`。
 
