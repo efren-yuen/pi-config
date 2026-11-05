@@ -40,15 +40,29 @@ function summarize(triage: string): string {
 }
 
 /**
+ * 注入给模型的一行摘要：只留三个决策信号。
+ * 置信度明细、risk 刻度说明、路由建议（AGENTS.md 已写）、成本统计在每轮请求里
+ * 都是重复信息，展开态才看得到。
+ */
+function condense(triage: string): string {
+	const category = /^category: (\S+)/m.exec(triage)?.[1] ?? "?";
+	const risk = /^risk: ([\d.]+)/m.exec(triage)?.[1] ?? "?";
+	const scope = /^clear_scope: ([\d.]+)/m.exec(triage)?.[1] ?? "?";
+	return `【Jev】category=${category} · risk=${risk}/3 · clear_scope=${scope}`;
+}
+
+/**
  * 默认只画一行摘要，ctrl+o 展开全文。
  * 渲染层折叠不影响上下文：模型收到的始终是完整的 content。
  */
 function registerRenderer(pi: ExtensionAPI): void {
 	pi.registerMessageRenderer("jev_triage", (message, options, theme) => {
-		const summary = (message.details as { summary?: string } | undefined)?.summary ?? "jev";
+		const summary = (message.details as { summary?: string; fullText?: string } | undefined)?.summary ?? "jev";
 		const head = theme.fg("accent", "◆ ") + theme.fg("muted", summary);
 		if (!options.expanded) return new Text(head, options.outputPad, 0);
-		const body = typeof message.content === "string" ? message.content : "";
+		// 展开态显示 Jev 原始输出，不显示注入给模型的那一行
+		const full = (message.details as { fullText?: string } | undefined)?.fullText;
+		const body = full ?? (typeof message.content === "string" ? message.content : "");
 		return new Text(`${head}\n${body}`, options.outputPad, 0);
 	});
 }
@@ -69,9 +83,9 @@ export default function jevTriage(pi: ExtensionAPI): void {
 		return {
 			message: {
 				customType: "jev_triage",
-				content: `【Jev 需求分流（自动，决策支持非安全边界）】\n${triage}\n\n按路由建议行动；建议与实际代码事实冲突时，以代码为准并向用户说明。`,
+				content: condense(triage),
 				display: true,
-				details: { summary: summarize(triage) },
+				details: { summary: summarize(triage), fullText: triage },
 			},
 		};
 	});
