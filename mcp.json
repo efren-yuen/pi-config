@@ -13,12 +13,6 @@
       },
       "enabled": false
     },
-    "context7": {
-      "url": "https://mcp.context7.com/mcp",
-      "description": "库/框架官方文档与代码示例：按库检索、拉取文档",
-      "timeout": 60,
-      "exposure": "codemode"
-    },
     "tabularis": {
       "command": "/usr/bin/tabularis",
       "args": [

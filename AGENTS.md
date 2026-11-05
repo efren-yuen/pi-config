@@ -13,7 +13,7 @@
 
 ## 查文档
 
-库/框架/SDK 文档走 context7 MCP。要整段文档用 `bin/c7 docs <id> <主题> --tokens 16000`（MCP 没有 tokens 参数），429 限流时设 `CONTEXT7_API_KEY`。
+库/框架/SDK 文档一律走 `bin/c7`：`c7 search <关键词>` 找 id，`c7 docs <id> <主题> --tokens 16000` 拉文档。429 限流时设 `CONTEXT7_API_KEY`。
 
 ## 数据库
 
