@@ -19,7 +19,8 @@
         "--mcp"
       ],
       "exposure": "codemode",
-      "description": "本地数据库客户端（PostgreSQL/MySQL/SQLite）：列出连接与表、读取表结构、执行 SQL"
+      "description": "本地数据库客户端（PostgreSQL/MySQL/SQLite）：列出连接与表、读取表结构、执行 SQL",
+      "enabled": false
     }
   }
 }
