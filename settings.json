@@ -36,9 +36,8 @@
     "opencode-go/glm-5.3-flash": "high"
   },
   "packages": [
-    "npm:@juicesharp/rpiv-todo",
-    "npm:@juicesharp/rpiv-ask-user-question",
-    "npm:pi-slate"
+    "npm:pi-slate",
+    "npm:@ssk_dev/rpiv-ask-user-question-lean"
   ],
   "hideThinkingBlock": false,
   "extensionChangelogVersions": {
