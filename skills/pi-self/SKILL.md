@@ -9,9 +9,9 @@ description: 修改 pi 自身配置时使用（~/.pi/agent 下的 bin/、skills/
 
 ## 改 CLI 调用形式 → 只改两处
 
-动了 `bin/c7`、`bin/web`、`bin/lsp`、`bin/db` 的子命令或选项，跟着改：
+动了 `bin/c7`、`bin/web`、`bin/lsp` 的子命令或选项，跟着改：
 
-1. `skills/<name>/SKILL.md` 的命令清单
+1. `AGENTS.md` 里该命令的说明（`bin/c7` 就写在「查文档」一节），没有则改 `skills/<name>/SKILL.md` 的命令清单
 2. `agents/scout.md`、`agents/reviewer.md` 里提到该命令的地方
 
 **不需要改权限网关**——它不再维护任何命令白名单。以前那套「三处同步」正是白名单制的代价，

@@ -1,7 +1,7 @@
 {
   "defaultProvider": "opencode-go",
   "defaultModel": "deepseek-v4.1-flash",
-  "lastChangelogVersion": "1.4.0",
+  "lastChangelogVersion": "1.5.0",
   "theme": "gruvbox-material",
   "defaultProjectTrust": "ask",
   "compaction": {
@@ -33,7 +33,6 @@
     "opencode-go/qwen3.7-plus": "medium",
     "opencode-go/gpt-5.6-luna": "high",
     "openai-codex/gpt-5.6-terra": "high",
-    "opencode-go/deepseek-v4-flash": "high",
     "opencode-go/glm-5.3-flash": "high"
   },
   "packages": [
@@ -42,19 +41,7 @@
     "npm:pi-slate"
   ],
   "hideThinkingBlock": false,
-  "tidy": {
-    "enabled": false,
-    "icons": false,
-    "frameMessages": false,
-    "groupTools": false,
-    "alwaysShowTools": [
-      "edit",
-      "write",
-      "bash",
-      "grep",
-      "find"
-    ],
-    "bashResultLines": 5,
-    "diffLines": 40
+  "extensionChangelogVersions": {
+    "{\"source\":\"npm:pi-slate\",\"scope\":\"user\"}": "0.2.0"
   }
 }

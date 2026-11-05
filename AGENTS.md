@@ -5,11 +5,19 @@
 ## 干活方式
 
 单文件改动、查询、解释 —— 自己做完，不要起 subagent。
-跨文件改动、影响面不清楚 —— 走 `/plan`，等确认后再 `/implement`。
+跨文件改动、影响面不清楚 —— 先出方案等我确认：改哪些文件、为什么、怎么验证，确认后再动手。
 
 「不要起 subagent」只免去子代理，不免去任务清单：3 步以上的活（含调研），先建 todo 再动手。
 
 动手前先说清楚要改哪里、为什么。
+
+## 查文档
+
+库/框架/SDK 文档走 context7 MCP。要整段文档用 `bin/c7 docs <id> <主题> --tokens 16000`（MCP 没有 tokens 参数），429 限流时设 `CONTEXT7_API_KEY`。
+
+## 数据库
+
+所有库操作走 tabularis MCP（`mcp__tabularis__*`：`list_connections` → `list_tables` / `describe_table` → `run_query`），不要另找 SQL 入口。MCP 侧默认只读，写操作需要我在客户端里开。
 
 ## 改动纪律
 
