@@ -1,0 +1,6 @@
+[submodule "extensions/pi-tool-ui"]
+	path = extensions/pi-tool-ui
+	url = https://github.com/efren-yuen/pi-tool-ui.git
+[submodule "extensions/pi-status-footer"]
+	path = extensions/pi-status-footer
+	url = https://github.com/efren-yuen/pi-status-footer.git

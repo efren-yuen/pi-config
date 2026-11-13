@@ -41,9 +41,7 @@
       "source": "npm:pi-compact-tools@0.17.0",
       "extensions": [],
       "themes": []
-    },
-    "/home/efren/Workspace/project/pi/pi-tool-ui",
-    "../../Workspace/project/pi/pi-status-footer"
+    }
   ],
   "hideThinkingBlock": false,
   "extensionChangelogVersions": {
