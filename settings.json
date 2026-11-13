@@ -42,7 +42,8 @@
       "extensions": [],
       "themes": []
     },
-    "/home/efren/Workspace/project/pi/pi-tool-ui"
+    "/home/efren/Workspace/project/pi/pi-tool-ui",
+    "../../Workspace/project/pi/status-footer"
   ],
   "hideThinkingBlock": false,
   "extensionChangelogVersions": {
