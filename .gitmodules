@@ -4,3 +4,6 @@
 [submodule "extensions/pi-status-footer"]
 	path = extensions/pi-status-footer
 	url = https://github.com/efren-yuen/pi-status-footer.git
+[submodule "extensions/pi-subagent"]
+	path = extensions/pi-subagent
+	url = https://github.com/efren-yuen/pi-subagent.git
