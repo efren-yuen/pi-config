@@ -10,7 +10,7 @@
  */
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import { Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { Container, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 type Status = "pending" | "in_progress" | "completed";
@@ -41,8 +41,8 @@ const GLYPH: Record<Status, string> = {
 	completed: "✓",
 };
 
-/** 输入框上方最多 5 行，超出收成一句，不挤占编辑区。 */
-const MAX_WIDGET_ROWS = 5;
+/** 输入框上方最多显示 10 条任务，超出收成一句，不挤占编辑区。 */
+const MAX_WIDGET_ROWS = 10;
 
 const WIDGET_KEY = "todo";
 
@@ -128,6 +128,8 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Keep a todo list for multi-step work. Submit the whole table each time; tasks: [] clears it. At most one task may be in_progress.",
 		parameters: TodoParams,
+		// 正常更新只显示底部 widget，不绘制聊天卡片及其背景。
+		renderShell: "self",
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const next = params.tasks as Task[];
@@ -146,32 +148,17 @@ export default function (pi: ExtensionAPI) {
 			};
 		},
 
-		renderCall(args, theme) {
-			const count = Array.isArray(args.tasks) ? args.tasks.length : 0;
-			return new Text(theme.fg("toolTitle", theme.bold("todo ")) + theme.fg("muted", `${count} 条`), 0, 0);
+		renderCall() {
+			return new Container();
 		},
 
-		renderResult(result, { expanded }, theme) {
-			const details = result.details as TodoDetails | undefined;
-			const list = details?.tasks ?? [];
-			if (list.length === 0) return new Text(theme.fg("dim", "任务表为空"), 0, 0);
-			const done = list.filter((t) => t.status === "completed").length;
-			const shown = expanded ? list : list.slice(0, 6);
-			const lines = shown.map((t, i) => {
-				const mark =
-					t.status === "completed"
-						? theme.fg("success", GLYPH[t.status])
-						: t.status === "in_progress"
-							? theme.fg("accent", GLYPH[t.status])
-							: theme.fg("dim", GLYPH[t.status]);
-				const body = t.status === "completed" ? theme.fg("dim", t.content) : theme.fg("muted", t.content);
-				return truncateToWidth(`${mark} ${i + 1}. ${body}`, 120);
-			});
-			if (!expanded && list.length > shown.length) {
-				lines.push(theme.fg("dim", `… 还有 ${list.length - shown.length} 条`));
+		renderResult(result, _options, theme, context) {
+			const message = result.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+			// 隐藏正常结果，但保留校验失败和执行错误。
+			if (context.isError || message.startsWith("Error:")) {
+				return new Text(theme.fg("error", message || "todo 更新失败"), 0, 0);
 			}
-			lines.push(theme.fg("dim", `${done}/${list.length} 完成`));
-			return new Text(lines.join("\n"), 0, 0);
+			return new Container();
 		},
 	});
 

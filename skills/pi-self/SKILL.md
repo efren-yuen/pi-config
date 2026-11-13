@@ -1,121 +1,60 @@
 ---
 name: pi-self
-description: 修改 pi 自身配置时使用（~/.pi/agent 下的 bin/、skills/、agents/、extensions/、settings.json）。包含几处必须同步改动的位置，以及改完之后的生效条件。
+description: 维护 ~/.pi/agent 全局配置、CLI、技能和扩展时使用，包含同步检查、验证与生效要求。
 ---
 
-# 维护 pi 自身
+# 维护 Pi 全局配置
 
-`~/.pi/agent` 有几处隐性耦合，改错顺序会表现成「改了但没生效」。
+以下配置路径均相对 `~/.pi/agent/`，命令使用完整路径。
 
-## 改 CLI 调用形式 → 只改两处
+## CLI 同步与工具依赖
 
-动了 `bin/c7`、`bin/web`、`bin/lsp` 的子命令或选项，跟着改：
+- 修改或删除 CLI 时，检索 `AGENTS.md`、`skills/`、`agents/`、`prompts/`、`extensions/` 中的实际引用，只同步受影响处，不固定“两处”或“三处”。
+- `fd`、`rg` 是 Pi 的工具依赖，不作为自写脚本随意删除；不要仅凭文件是否在 `bin/` 或 PATH 中判断归属。
+- 权限网关不维护 CLI 命令白名单，新增 CLI 不需要添加白名单。
 
-1. `AGENTS.md` 里该命令的说明（`bin/c7` 就写在「查文档」一节），没有则改 `skills/<name>/SKILL.md` 的命令清单
-2. `agents/scout.md`、`agents/reviewer.md` 里提到该命令的地方
+## LSP 维护
 
-**不需要改权限网关**——它不再维护任何命令白名单。以前那套「三处同步」正是白名单制的代价，
-删掉白名单之后这条纪律也就没了。
-
-## lsp 只认全局配置
-
-`bin/lsp` 刻意不读项目里的 `.pi/lsp.json`：那一层能覆盖 `command` 和 `env`，
-而 `lsp-diagnostics` 扩展在每次 edit/write 之后自动跑 diag——等于 clone 一个仓库、
-改一个文件，仓库里写的命令就在本机跑起来了，全程无提示。配置只有内置 + `lsp/servers.json` 两层。
-
-自动诊断也没有开关，永远开着。不想要就把扩展删掉，不需要为它留一个配置项。
-
-## 改完 bin/lsp 必须 `lsp stop`
-
-语言服务器由常驻 daemon 托管，不停掉它还在跑旧代码。这是最容易浪费时间的一条。
-
-## 动 LSP 协议层前后都跑测试
+- 配置只认内置默认与全局 `lsp/servers.json`，不读取项目 `.pi/lsp.json`。
+- 修改 `bin/lsp` 后先停止旧 daemon，下一次调用才会加载新代码；停止会影响其他会话正在使用的实例：
 
 ```bash
-node /home/efren/.pi/agent/lsp/test/protocol-test.js
+~/.pi/agent/bin/lsp stop
 ```
 
-假语言服务器 + 20 条断言，覆盖分帧、握手、**服务器→客户端请求必须全部被应答**（漏答会让服务器静默挂起，表现成客户端超时）、文档重开、按符号定位。
-
-## settings.json 改完先校验语法
+- 修改 LSP 协议层前后都运行：
 
 ```bash
-python3 -c "import json; json.load(open('/home/efren/.pi/agent/settings.json')); print('OK')"
+node ~/.pi/agent/lsp/test/protocol-test.js
 ```
 
-语法错会静默丢配置，重启会话前先过一遍。
+## 配置验证与生效
 
-## 扩展是 .ts，走 node 的 type-stripping
+- 修改 JSON 后先验证语法，例如：
 
-`extensions/*.ts` 不经编译直接加载，只能用可以纯剥离类型的语法。不要用 enum、namespace、构造器参数属性、装饰器。
+```bash
+python3 -m json.tool ~/.pi/agent/settings.json >/dev/null
+```
 
-## registerTool 类扩展不过 permission-gate
+- 修改配置、技能或扩展后执行 `/reload`；验证默认加载效果时使用新会话。LSP daemon 按上一节单独停止。
 
-网关只挂在 `tool_call`（read/write/edit/grep/find/ls/bash/powershell）和 `user_bash` 上。
-扩展用 `pi.registerTool()` 注册的工具**完全不经过它**。
+## 扩展权限与工具范围
 
-所以新增这类工具时，两件事必须自己做：
+- `extensions/permission-gate.ts` 是按工具名称和类型执行检查的黑名单，不是沙箱；新扩展工具不会自动获得所有路径和命令保护，必须检查权限处理、非交互行为及 subagent 可见范围。
+- 需要交互的操作自行检查上下文是否支持 UI；无 UI 时不得假定能弹窗确认。
+- agent 应显式声明 `tools:`。`--tools` 默认仍保留 MCP 工具，不能据此认定 MCP 已被排除；需要限制时检查 MCP 专用过滤规则。
 
-1. 要限交互就自己判 `ctx.hasUI`（print/json 模式为 `false`，subagent 走 `--mode json -p`）。
-2. 确认哪些 agent 会继承到它。`extensions/subagent/index.ts:307` 只有在 agent 声明了
-   `tools:` 时才传 `--tools`（严格白名单，扩展工具一并挡掉）；**不声明 `tools:` 的 agent
-   会拿到全部内置工具 + 全部扩展工具**，包括 `subagent` 自己（可递归）。四个 agent 现在都声明了。
+## subagent 分叉维护
 
-（历史：`extensions/external-agents.ts` 桥接 claude/codex 就是踩了这两条，已删除。）
-
-## extensions/subagent 是上游 example 的分叉
-
-`extensions/subagent/` 复制自 pi 自带的
-`/usr/lib/node_modules/pi/packages/coding-agent/examples/extensions/subagent/`。
-`agents.ts` 与上游完全一致；`index.ts` 改了三处：
-
-1. 顶部多 import `formatAgentList`（来自本地 `agents.ts`）。
-2. `export default` 开头启动时 `discoverAgents()`，把真实 agent 名单写进工具描述
-   （`startupAgentList`），避免模型凭空猜 agent 名；若 agent 超过 10 个会截断并提示剩余数。
-3. `TaskItem` / `ChainItem` / `SubagentParams.agent` 的 tool description 文案
-   （澄清 agent 名必须来自名单、agentScope 值不是 agent 名，以及 `{previous}` 必须字面写、
-   parallel/chain 按数据依赖选）。
-
-`pi update` 之后上游修的 bug 不会自动进来，而且没有任何提示。升级后查一次漂移：
+`extensions/subagent/` 是上游示例的本地分叉，不会随 Pi 升级自动合并修复。升级后比较上游差异，再决定同步内容，不以固定差异数量判断是否过时。例如：
 
 ```bash
 diff -u /usr/lib/node_modules/pi/packages/coding-agent/examples/extensions/subagent/index.ts \
         ~/.pi/agent/extensions/subagent/index.ts
 ```
 
-只看到上面这三处 hunk 就是没漂；多出别的说明上游改了，需要手工合。
+## MCP 约定
 
-## 权限网关是黑名单，不要往回改成白名单
-
-`extensions/permission-gate.ts` 只拦四类事：删系统目录 / 格式化磁盘 / fork bomb、
-git force push、命令文本引用受保护路径、把凭据或环境变量喂给 curl。
-加上工具侧对 `read/write/edit/grep/find/ls` 的受保护路径检查。**其余一律放行，不弹确认框。**
-
-它曾经是白名单制（20 个 SAFE_* 集合 + 手写 shell 分词器，544 行），
-代价是每接一个 CLI 都要改三个地方，漏一处就是莫名其妙的 `Denied`。
-真正的边界是最小权限账号、备份和人工审查，不是这个文件。想加限制之前先问：
-这条规则挡住的损失，值不值得它带来的维护成本。
-
-## 外部能力按需选 CLI 或 MCP
-
-简单、低频的外部能力优先写 CLI 放 `bin/`；需要持久连接或结构化工具调用时可用 MCP。
-skill 负责说明何时用、怎么用，不是执行接口，可以配合 CLI 或 MCP，无需二选一。
-
-全局 `mcp.json` 保存公共服务定义，默认 `enabled: false`；需要的项目在 `.pi/mcp.json`
-中用同名服务设置 `enabled: true`，无需重复命令配置。项目配置在获得项目信任后加载。
-
-网关是黑名单，不需要也不应该给新 CLI 加白名单；若 CLI 要限制 subagent 联网等场景，
-参照 `WEB_CLI` 在 `permission-gate.ts` 里加一条黑名单规则，并保持规则数最小。
-MCP 调用同样经过工具权限流程；接入时保留现有权限检查和人工确认，不因服务已启用而跳过。
-
-## bin/ 下有两类文件，只有一类能删
-
-pi 托管的（**不要删**）：`fd`、`rg`。
-
-内置 `find` 工具的实现就是 fd（`core/tools/find.js`），拿不到 fd 就抛 `fd is not available and could not be downloaded`。查找顺序是 `bin/<name>` → 系统 PATH（`fd` 认 `fdfind`）→ 从 GitHub 下载最新 release，交互模式启动时还会 `ensureTool()` 预热一次。本机没装对应系统包时，删掉就会在下次启动重新下一遍。
-
-`find` 属于只读工具集（`createReadOnlyTools`）。pi 写死的默认集是 read/bash/edit/write（`dist/core/sdk.js:139`），不含 find；本机在 `settings.json` 的 `defaultTools` 里补上了 grep/find/ls，四个 agent 也都在 `tools:` 里声明了 `find`，**所以主 Agent 和全部 subagent 都依赖 fd**。
-
-自写的（可以删，但要连带清理）：`c7`、`web`、`lsp`。删之前先按上面「三处同步」把 skill、agents、permission-gate 白名单一起处理掉。
-
-判断某个二进制是不是 pi 托管的，看 `utils/tools-manager.js` 的 `TOOLS` 表，不要靠「是否在 PATH」或「是否在网关白名单」推断——内置工具（find/read/grep 等）不走 bash，网关对它们只做凭据路径拦截，不查命令白名单。
+- CBM 只通过 MCP 使用，不恢复 CLI 调用指令或独立技能。
+- 本机全局 `mcp.json` 定义公共服务并默认关闭；需要的项目在 `.pi/mcp.json` 中用同名服务设置 `enabled: true`，无需重复命令配置。
+- 项目配置在获得项目信任后加载；启用服务不等于跳过权限检查和人工确认。

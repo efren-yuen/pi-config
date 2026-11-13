@@ -76,6 +76,23 @@ export default function tmuxAttentionBridge(pi: ExtensionAPI): void {
 		await run(["turn-done"]);
 	});
 
+	// 等用户审批/回答时标 blocked（红）。ui_prompt_start/end 只由 ctx.ui.* 的阻塞式
+	// 提示触发，嵌套提示由 pi 合并成一对，不需要自己计数。
+	pi.on("ui_prompt_start", async (event, ctx) => {
+		if (ctx?.mode !== "tui" || !process.env.TMUX) return;
+		const title = event.title ? `: ${event.title}` : "";
+		// CLI 的 --reason 不接受 tab/换行，统一压成空格。
+		const reason = `${event.kind}${title}`.replace(/[\t\n\r]+/g, " ").slice(0, REASON_MAX);
+		await run(["blocked", "--source", "pi", "--reason", reason]);
+	});
+
+	pi.on("ui_prompt_end", async (_event, ctx) => {
+		if (ctx?.mode !== "tui" || !process.env.TMUX) return;
+		// 只清 attention 标记，不动 @agent_pane_context_active：
+		// agent 还在跑就自动回到 working 黄，空闲就回到无图标。
+		await run(["clear"]);
+	});
+
 	// pi 退出时清掉挂着的 working 状态，防止 pane 显示假活跃。
 	pi.on("session_shutdown", async (_event, ctx) => {
 		if (ctx?.mode !== "tui" || !process.env.TMUX) return;

@@ -1,0 +1,17 @@
+{
+  "style": "compact",
+  "mode": "normal",
+  "tools": [
+    "read",
+    "bash",
+    "grep",
+    "find",
+    "ls",
+    "edit",
+    "write"
+  ],
+  "custom_tools": {
+    "enabled": true,
+    "exclude": []
+  }
+}
