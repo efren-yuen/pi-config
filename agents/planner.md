@@ -1,7 +1,7 @@
 ---
 name: planner
 description: 基于只读上下文制定可执行、可审查且不实施的变更计划。
-model: opencode-go/gpt-5.6-luna:high
+model: opencode-go/gpt-6-luna:high
 tools: read, grep, find, ls
 ---
 
